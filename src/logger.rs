@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::Local;
 use colored::Colorize;
 use std::fmt::{self, Write};
 
@@ -15,11 +15,15 @@ impl Logger {
     ///
     /// # Пример
     /// ```
-    /// use my_crate::{Logger, LogLevel};
-    /// Logger::log("Сервис запущен", LogLevel::Info);
+    /// mod logger;
+    /// use logger::prelude::*;
+    /// 
+    /// fn main() {
+    ///     log("Service started", Info);
+    /// }
     /// ```
     pub fn log(content: impl AsRef<str>, log_level: LogLevel) {
-        let date = Utc::now().format("%Y-%m-%d %H:%M:%S");
+        let date = Local::now().format("%Y-%m-%d %H:%M:%S");
         let mut buf = String::new();
 
         // Префикс: [INFO]     2026-06-10 10:10:01:
