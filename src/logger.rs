@@ -23,7 +23,7 @@ impl Logger {
     /// }
     /// ```
     pub fn log(content: impl AsRef<str>, log_level: LogLevel) {
-        let date = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let date = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
         let mut buf = String::new();
 
         // Префикс: [INFO]     2026-06-10 10:10:01:
@@ -38,7 +38,8 @@ impl Logger {
 
         match log_level {
             LogLevel::Info    => println!("{}", plain.bright_blue()),
-            LogLevel::Trace   => println!("{}", plain.bright_cyan()),
+            LogLevel::Trace   => println!("{}", plain.bright_black()),
+            LogLevel::Debug   => println!("{}", plain.bright_green()),
             LogLevel::Warning => println!("{}", plain.yellow()),
             LogLevel::Error   => eprintln!("{}", plain.bright_red()),
         };
@@ -53,6 +54,7 @@ pub fn log(content: impl AsRef<str>, log_level: LogLevel) {
 pub enum LogLevel {
     Info,
     Trace,
+    Debug,
     Warning,
     Error,
 }
@@ -62,6 +64,7 @@ impl LogLevel {
         match self {
             LogLevel::Info => "INFO",
             LogLevel::Trace => "TRACE",
+            LogLevel::Debug => "DEBUG",
             LogLevel::Warning => "WARNING",
             LogLevel::Error => "ERROR",
         }
