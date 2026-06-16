@@ -1,33 +1,29 @@
+mod db;
 mod logger;
+mod commands;
 use logger::prelude::*;
+use commands::Command;
 
 use std::{
-    env, io::{self, Read, Write}, net::{SocketAddr, TcpListener, TcpStream}, str::from_utf8, thread
+    env,
+    io::{self, BufRead, Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    str::from_utf8,
+    thread,
+    time::Duration,
+    io::Error as IOError
 };
-use chrono::{DateTime, Utc};
-use uuid::Uuid;
+
+use crate::commands::handle_command;
 
 fn main() {
     start_server();
 }
 
-struct UserProfile {
-    id: Uuid,
-    address: SocketAddr,
-    nickname: String,
-    created_at: DateTime<Utc>,
-}
-
-impl UserProfile {
-    fn new(id: Uuid, address: SocketAddr, nickname: String, created_at: DateTime<Utc>) -> Self {
-        Self { id, address, nickname, created_at }
-    }
-}
-
 fn start_server() {
     let address = env::args()
         .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:6969".to_string());
+        .unwrap_or_else(|| "0.0.0.0:6969".to_string());
 
     let listener = TcpListener::bind(&address).expect("Failed to bind server address");
     log(format!("Server listening on {address}"), Info);
@@ -35,7 +31,6 @@ fn start_server() {
     for stream_result in listener.incoming() {
         match stream_result {
             Ok(stream) => {
-                // Передаём владение stream в поток
                 thread::spawn(move || {
                     handle_client(stream);
                 });
@@ -48,34 +43,95 @@ fn start_server() {
 }
 
 fn handle_client(mut stream: TcpStream) {
-    let peer_addr = stream.peer_addr().unwrap();
-    let nickname = peer_addr.port().to_string(); // временно используем порт как ник
+    let peer_address = stream.peer_addr().unwrap();
+    log(format!("Handling connection from: {peer_address}"), Trace);
 
-    let user_profile = UserProfile::new(Uuid::new_v4(), peer_addr, nickname.clone(), Utc::now());
-
-    log(format!("Handling connection from: {peer_addr}"), Trace);
-    log(format!("Nickname set to: {nickname}"), Trace);
+    let _ = stream.set_read_timeout(None);
+    let user = get_or_create_user(stream.try_clone().expect("Stream has blocked in handle_client"), peer_address, None);
+    let user_address = user.address;
+    let user_nickname = user.nickname;
 
     let mut buffer = [0; 1024];
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => {
-                log(format!("Client {} closed connection", peer_addr), Trace);
+                log(
+                    format!("Client {user_address} ({user_nickname}) closed connection"),
+                    Trace,
+                );
                 break;
             }
             Ok(n) => {
-                let msg = from_utf8(&buffer[0..n]).unwrap_or("Invalid UTF-8").trim_end();
-                log(format!("Message from {nickname}: {msg}"), Info);
-                // Опционально: можно отправить ответ клиенту
-                let response = format!("Server received: {msg}\n");
-                let _ = stream.write_all(response.as_bytes());
+                let msg = from_utf8(&buffer[0..n])
+                    .unwrap_or("Invalid UTF-8")
+                    .trim_end();
+                log(
+                    format!("Message from {user_nickname} ({user_address}): {msg}"),
+                    Info,
+                );
+
+                if let Some(command) = Command::from_str(msg) {
+                    handle_command(stream.try_clone().expect("Stream has blocked in handle_client"), command);
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                log(format!("Error reading from {peer_addr}: {e}"), Warning);
+                log(
+                    format!("Error reading from {user_address} ({user_nickname}): {e}"),
+                    Warning,
+                );
                 break;
             }
         }
     }
-    log(format!("Connection finished for: {peer_addr}"), Trace);
+    log(
+        format!("Connection finished for: {user_address} ({user_nickname})"),
+        Trace,
+    );
+}
+
+fn request_nickname(mut stream: TcpStream) -> Result<String, IOError> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut nickname = String::new();
+    let request_nickname = "Please, enter your nickname (timeout within 15 secs): ";
+    let _ = stream.write_all(request_nickname.as_bytes());
+
+    match reader.read_line(&mut nickname) {
+        Ok(0) | Err(_) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Disconnected: timeout while handshake with client",
+            ))
+            .into();
+        }
+        Ok(_) => Ok(nickname.trim().to_string()),
+    }
+}
+
+#[tokio::main]
+pub async fn get_or_create_user(stream: TcpStream, address: SocketAddr, nickname: Option<&str>) -> db::User {
+    let pool = db::init_database(env!("CARGO_PKG_NAME")).await.unwrap();
+    let _ = db::migrate(&pool).await;
+
+    if let Some(user) = db::get_user_by_address(&pool, &address).await.unwrap() {
+        log(format!("Found user by address: {:?} ({})", user.nickname, user.address), Info);
+        return user;
+    } else if nickname != None && let Some(user) = db::get_user_by_nickname(&pool, nickname.unwrap()).await.unwrap() {
+        log(format!("Found user by nickname: {:?} ({})", user.nickname, user.address), Info);
+        return user;
+    } else {
+        let requested_nickname = &match request_nickname(stream) {
+            Ok(requested_nickname) => requested_nickname.to_string(),
+            Err(e) => {
+                log(format!("Client '{address}' connection timeout!"), Warning);
+                Err(e).expect(&format!("Client '{address}' connection timeout!").to_string())
+            },
+        }.to_string();
+
+        let user = db::add_user(&pool, address, requested_nickname).await.unwrap();
+        log(format!("User inserted with ID: '{}' and nickname '{}'", user.id, user.nickname), Info);
+        return user;
+    }
 }
