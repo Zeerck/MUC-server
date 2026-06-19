@@ -1,6 +1,5 @@
 use std::{io::Write, net::TcpStream};
-
-use super::logger::prelude::*;
+use crate::{error, trace};
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -11,26 +10,41 @@ pub enum Command {
 impl Command {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "ping" => Some(Command::Ping),
-            "exit" => Some(Command::Exit),
+            "/ping" => Some(Command::Ping),
+            "/exit" => Some(Command::Exit),
             _ => None
         }
     }
 }
 
-pub fn handle_command(stream: TcpStream, command: Command) {
+pub fn handle_command(stream: TcpStream, command: Command) -> bool {
     match command {
-        Command::Ping => ping_handler(stream.try_clone().expect("Error while clonning stream")),
-        Command::Exit => exit_handler(stream.try_clone().expect("Error while clonning stream")),
+        Command::Ping => {
+            match stream.try_clone() {
+                Ok(cloned) => ping_handler(cloned),
+                Err(e) => error!("Failed to clone stream for PING: {e}"),
+            };
+            true
+        }
+        Command::Exit => { 
+            match stream.try_clone() {
+                Ok(cloned) => exit_handler(cloned),
+                Err(e) => error!("Failed to clone stream for EXIT: {e}"),
+            };
+            false
+        }
     }
 }
 
 fn ping_handler(mut stream: TcpStream) {
-    log("Server received PING command", Trace);
-    let _ = stream.write_all("Server: PONG\n".as_bytes());
+    trace!("Server received PING command");
+    let _ = stream.write_all(b"Server: PONG\n");
 }
 
-fn exit_handler(stream: TcpStream) {
-    log("Server received EXIT command", Trace);
-    stream.shutdown(std::net::Shutdown::Both).unwrap();
+fn exit_handler(mut stream: TcpStream) {
+    trace!("Server received EXIT command");
+    let _ = stream.write_all(b"Disconnected from server\n");
+    if let Err(e) = stream.shutdown(std::net::Shutdown::Both) {
+        error!("Failed to shutdown stream: {e}");
+    }
 }

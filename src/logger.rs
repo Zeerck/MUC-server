@@ -2,31 +2,66 @@ use chrono::Local;
 use colored::Colorize;
 use std::fmt::{self, Write};
 
-// в lib.rs или logger.rs
-pub mod prelude {
-    pub use super::log;
-    pub use super::LogLevel::*;
+pub struct Logger;
+
+#[macro_export]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Trace)
+    };
 }
 
-pub struct Logger;
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)*) => {
+        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Info)
+    };
+}
+
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Debug)
+    };
+}
+
+#[macro_export]
+macro_rules! warning {
+    ($($arg:tt)*) => {
+        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Warning)
+    };
+}
+
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)*) => {
+        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Error)
+    };
+}
+
+#[macro_export]
+macro_rules! fatal {
+    ($($arg:tt)*) => {
+        $crate::logger::log(format!($($arg)*), $crate::logger::LogLevel::Fatal)
+    };
+}
 
 impl Logger {
     /// Логирует сообщение с указанным уровнем.
     ///
     /// # Пример
     /// ```
-    /// mod logger;
-    /// use logger::prelude::*;
+    /// mod logger::*;
     /// 
     /// fn main() {
-    ///     log("Service started", Info);
+    ///     let text = "Some information";
+    ///     info!("Content: {text}");
     /// }
     /// ```
-    pub fn log(content: impl AsRef<str>, log_level: LogLevel) {
-        let date = Local::now().format("%Y-%m-%d %H:%M:%S.%3f");
+    fn log(content: impl AsRef<str>, log_level: LogLevel) {
+        let date = Local::now().format("%Y-%m-%d %H:%M:%S.%f");
         let mut buf = String::new();
 
-        // Префикс: [INFO]     2026-06-10 10:10:01:
         write!(
             buf,
             "{:<10} {date}:",
@@ -37,11 +72,12 @@ impl Logger {
         let plain = format!("{} {}", buf.bold(), content.as_ref());
 
         match log_level {
-            LogLevel::Info    => println!("{}", plain.bright_blue()),
-            LogLevel::Trace   => println!("{}", plain.bright_black()),
-            LogLevel::Debug   => println!("{}", plain.bright_green()),
-            LogLevel::Warning => println!("{}", plain.yellow()),
-            LogLevel::Error   => eprintln!("{}", plain.bright_red()),
+            LogLevel::Info    =>  println!("{}", plain.bright_blue()),
+            LogLevel::Trace   =>  println!("{}", plain.bright_black()),
+            LogLevel::Debug   =>  println!("{}", plain.bright_green()),
+            LogLevel::Warning =>  println!("{}", plain.yellow()),
+            LogLevel::Error   =>  eprintln!("{}", plain.bright_red()),
+            LogLevel::Fatal   =>  eprintln!("{}", plain.red().bold().on_black()),
         };
     }
 }
@@ -57,6 +93,7 @@ pub enum LogLevel {
     Debug,
     Warning,
     Error,
+    Fatal,
 }
 
 impl LogLevel {
@@ -67,6 +104,7 @@ impl LogLevel {
             LogLevel::Debug => "DEBUG",
             LogLevel::Warning => "WARNING",
             LogLevel::Error => "ERROR",
+            LogLevel::Fatal => "FATAL",
         }
     }
 }
