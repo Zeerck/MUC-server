@@ -1,4 +1,4 @@
-use crate::{error, db};
+use crate::{db, error};
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Debug)]
@@ -6,14 +6,14 @@ pub struct Config {
     pub server_address: String,
     pub app_name: String,
     pub db_path: PathBuf,
-    pub nickname_timeout: u64,
     pub read_timeout: Duration,
+    pub handshake_timeout: Duration,
 }
 
 impl Config {
     pub fn from_env() -> Self {
         let server_address = env::var("SERVER_ADDRESS").unwrap_or_else(|error| {
-            error!("Failed to get 'SERVER_ADDRESS' from .env: {error}");
+            error!("Failed to get 'SERVER_ADDRESS' from .env: {error}\nUsing default address: 127.0.0.1:6969");
             "127.0.0.1:6969".to_string()
         });
 
@@ -22,17 +22,10 @@ impl Config {
             "MUC-server".to_string()
         });
 
-        let db_path = env::var("DB_PATH")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                db::get_db_path(&app_name).expect("Failed to build default DB path")
-            });
-
-        let nickname_timeout = env::var("NICKNAME_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
+        let db_path = match env::var("DB_PATH") {
+            Ok(val) if !val.trim().is_empty() => PathBuf::from(val),
+            _ => db::get_db_path(&app_name).expect("Failed to build default DB path"),
+        };
 
         let read_timeout = env::var("READ_TIMEOUT")
             .ok()
@@ -41,12 +34,19 @@ impl Config {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(300));
 
+        let handshake_timeout = env::var("HANDSHAKE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&t| t > 0)
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(10));
+
         Self {
             server_address,
             app_name,
             db_path,
-            nickname_timeout,
             read_timeout,
+            handshake_timeout,
         }
     }
 }

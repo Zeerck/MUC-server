@@ -17,7 +17,7 @@ impl Command {
     }
 }
 
-pub fn handle_command(stream: TcpStream, command: Command) -> bool {
+pub fn handle_command(stream: &TcpStream, command: Command) -> bool {
     match command {
         Command::Ping => {
             match stream.try_clone() {

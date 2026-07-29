@@ -1,15 +1,18 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use std::{fs, net::SocketAddr, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use std::{fs, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
 use uuid::{Uuid};
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 
-/// Структура пользователя, соответствует таблице `users`
 #[derive(Debug)]
 pub struct User {
     pub id: Uuid,
-    pub address: String,
-    pub nickname: String,
+    pub login: String,
+    pub password: String,
     pub created_at: DateTime<Local>,
 }
 
@@ -51,35 +54,34 @@ pub fn migrate(connection: &Connection) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS users (
             id BLOB PRIMARY KEY NOT NULL,
-            address TEXT NOT NULL UNIQUE,
-            nickname TEXT NOT NULL,
+            login TEXT NOT NULL UNIQUE,
+            password TEXT NOT NULL,
             created_at INTEGER NOT NULL
         )
         "#,
-        [],
+        params![],
     )?;
 
     Ok(())
 }
 
 /// Добавляет нового пользователя в базу
-pub fn add_user(connection: &Connection, address: SocketAddr, nickname: &str) -> Result<User> {
-    if !validate_nickname(nickname) {
-        anyhow::bail!("invalid nickname: must be 3-32 letters, numbers or underscores");
+pub fn add_user(connection: &Connection, login: &str, raw_password: &str) -> Result<User> {
+    if !validate_login(login) {
+        anyhow::bail!("invalid login: must be 3-32 letters, numbers or underscores");
     }
 
     let id = Uuid::new_v4();
-    let address_str = address.ip().to_string();
-    // let now = Local::now().naive_local().format(DATE_FORMAT).to_string();
+    let hashed_password = hash_password(raw_password).expect("Error while hashing password!");
     let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before epoch").as_secs() as i64;
 
     connection.execute(
-        "INSERT INTO users (id, address, nickname, created_at) VALUES (?, ?, ?, ?)",
-        params![&id, &address_str, &nickname, &now],
+        "INSERT INTO users (id, login, password, created_at) VALUES (?, ?, ?, ?)",
+        params![&id, &login, &hashed_password, &now],
     )?;
 
     let user = connection.query_row(
-        "SELECT id, address, nickname, created_at FROM users WHERE id = ?",
+        "SELECT id, login, password, created_at FROM users WHERE id = ?",
         params![&id],
         map_row_to_user,
     )?;
@@ -88,23 +90,22 @@ pub fn add_user(connection: &Connection, address: SocketAddr, nickname: &str) ->
 }
 
 /// Получает пользователя по никнейму
-pub fn get_user_by_nickname(connection: &Connection, nickname: &str) -> Result<Option<User>> {
+pub fn get_user_by_login(connection: &Connection, login: &str) -> Result<Option<User>> {
     let mut stmt = connection
-        .prepare("SELECT id, address, nickname, created_at FROM users WHERE nickname = ?")?;
+        .prepare("SELECT id, login, password, created_at FROM users WHERE login = ?")?;
     let user = stmt
-        .query_row(params![nickname], map_row_to_user)
+        .query_row(params![login], map_row_to_user)
         .optional()?;
 
     Ok(user)
 }
 
 /// Получает пользователя по адресу
-pub fn get_user_by_address(connection: &Connection, address: &SocketAddr) -> Result<Option<User>> {
-    let address_str = address.ip().to_string();
+pub fn get_user_by_id(connection: &Connection, id: Uuid) -> Result<Option<User>> {
     let mut stmt = connection
-        .prepare("SELECT id, address, nickname, created_at FROM users WHERE address = ?")?;
+        .prepare("SELECT id, login, password, created_at FROM users WHERE id = ?")?;
     let user = stmt
-        .query_row(params![&address_str], map_row_to_user)
+        .query_row(params![&id], map_row_to_user)
         .optional()?;
 
     Ok(user)
@@ -113,7 +114,7 @@ pub fn get_user_by_address(connection: &Connection, address: &SocketAddr) -> Res
 /// Возвращает всех пользователей в базе
 pub fn get_all_users(connection: &Connection) -> Result<Vec<User>> {
     let mut stmt = connection
-        .prepare("SELECT id, address, nickname, created_at FROM users ORDER BY created_at")?;
+        .prepare("SELECT id, login, password, created_at FROM users ORDER BY created_at")?;
     let users = stmt
         .query_map([], map_row_to_user)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -126,7 +127,7 @@ pub fn delete_user(connection: &Connection, id: &Uuid) -> Result<bool> {
     Ok(rows > 0)
 }
 
-pub fn validate_nickname(nick: &str) -> bool {
+pub fn validate_login(nick: &str) -> bool {
     let len = nick.len();
     if len < 3 || len > 32 {
         return false;
@@ -138,8 +139,8 @@ pub fn validate_nickname(nick: &str) -> bool {
 
 fn map_row_to_user(row: &Row) -> rusqlite::Result<User> {
     let id: Uuid = row.get(0)?;
-    let address: String = row.get(1)?;
-    let nickname: String = row.get(2)?;
+    let login: String = row.get(1)?;
+    let password: String = row.get(2)?;
     let timestamp: i64 = row.get(3)?;
     let dt_utc = match chrono::DateTime::from_timestamp_secs(timestamp) {
         Some(dt) => dt,
@@ -149,38 +150,52 @@ fn map_row_to_user(row: &Row) -> rusqlite::Result<User> {
         )),
     };
     let created_at = dt_utc.with_timezone(&Local);
-    // let naive = NaiveDateTime::parse_from_str(&created_at_str, DATE_FORMAT)
-    //     .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
-    // let created_at = Local.from_local_datetime(&naive).single().unwrap();
+
     Ok(User {
         id,
-        address,
-        nickname,
+        login,
+        password,
         created_at,
     })
+}
+
+fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let password_hash = argon2.hash_password(password.as_bytes(), &salt)?;
+
+    Ok(password_hash.to_string())
+}
+
+pub fn verify_password(password: &str, phc_hash: &str) -> bool {
+    let parsed_hash = match PasswordHash::new(phc_hash) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+
+    Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn test_db_operations() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         migrate(&conn)?;
 
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-        let nickname = "Alice";
+        let login = "Alice";
+        let password = "best_password_123";
 
-        let user = add_user(&conn, addr, nickname)?;
+        let user = add_user(&conn, login, &password)?;
         assert!(!user.id.is_nil());
 
-        let fetched = get_user_by_nickname(&conn, nickname)?;
+        let fetched = get_user_by_login(&conn, login)?;
         assert!(fetched.is_some());
         let user = fetched.unwrap();
-        assert_eq!(user.nickname, nickname);
-        assert_eq!(user.address, addr.ip().to_string());
+        assert_eq!(user.login, login);
+        assert_eq!(user.login, login.to_string());
 
         let all = get_all_users(&conn)?;
         assert_eq!(all.len(), 1);
@@ -188,7 +203,7 @@ mod tests {
         let deleted = delete_user(&conn, &user.id)?;
         assert!(deleted);
 
-        let after_delete = get_user_by_nickname(&conn, nickname)?;
+        let after_delete = get_user_by_login(&conn, login)?;
         assert!(after_delete.is_none());
 
         Ok(())
