@@ -114,13 +114,11 @@ fn handle_client(mut stream: TcpStream, db: Arc<Mutex<rusqlite::Connection>>) {
         }
         Err(e) => {
             warning!("Authentication failed for {peer_address}: {e}");
-            // Ошибку уже отправили клиенту внутри функций register/login
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
     };
 
-    // Сбрасываем таймаут на стандартное значение для чтения сообщений
     let _ = stream.set_read_timeout(Some(CONFIG.read_timeout));
 
     let user_login = user.login.clone();
@@ -174,10 +172,7 @@ fn register_user(
 
     trace!("Trying add user with login: '{login}' and address: {address} to Database...");
     let user = db::add_user(connection, login, password)?;
-    trace!(
-        "User inserted with ID: '{}' and login '{}'",
-        user.id, user.login
-    );
+    trace!("User inserted with ID: '{}' and login '{}'", user.id, user.login);
     Ok(user)
 }
 
