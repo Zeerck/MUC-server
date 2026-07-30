@@ -7,11 +7,7 @@ use commands::Command;
 use dotenvy::dotenv;
 
 use std::{
-    io::{self, BufRead, BufReader, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
-    str::from_utf8,
-    sync::{Arc, LazyLock, Mutex},
-    thread,
+    io::{self, BufRead, BufReader, Read, Write}, net::{Shutdown, SocketAddr, TcpListener, TcpStream}, str::from_utf8, sync::{Arc, LazyLock, Mutex}, thread, time::Duration,
 };
 
 use crate::{commands::handle_command, config::Config};
@@ -38,6 +34,8 @@ fn main() {
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
+        std::thread::sleep(Duration::from_millis(50));
+        std::process::exit(0);
     });
 
     let listener = TcpListener::bind(&CONFIG.server_address).expect("Failed to bind listener");

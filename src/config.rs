@@ -1,4 +1,4 @@
-use crate::{db, error};
+use crate::{db, trace};
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Debug)]
@@ -12,15 +12,15 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let server_address = env::var("SERVER_ADDRESS").unwrap_or_else(|error| {
-            error!("Failed to get 'SERVER_ADDRESS' from .env: {error}\nUsing default address: 127.0.0.1:6969");
-            "127.0.0.1:6969".to_string()
-        });
+        // Используем ok() чтобы игнорировать отсутствие переменной без паники и ошибок
+        let server_address = env::var("SERVER_ADDRESS")
+            .unwrap_or_else(|_| {
+                trace!("Environment parameter 'SERVER_ADDRESS' not found. Default address and port are being used: 0.0.0.0:1990.");
+                "0.0.0.0:1990".to_string()
+            });
 
-        let app_name = env::var("APP_NAME").unwrap_or_else(|error| {
-            error!("Failed to get 'APP_NAME' from .env: {error}");
-            "MUC-server".to_string()
-        });
+        let app_name = env::var("APP_NAME")
+            .unwrap_or_else(|_| "MUC-server".to_string());
 
         let db_path = match env::var("DB_PATH") {
             Ok(val) if !val.trim().is_empty() => PathBuf::from(val),

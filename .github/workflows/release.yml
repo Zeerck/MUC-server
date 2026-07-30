@@ -37,11 +37,11 @@ jobs:
         run: |
           mkdir staging
           copy target\release\MUC-server.exe staging\
-          Compress-Archive -Path staging\* -DestinationPath muc-server-windows-amd64.zip
+          Compress-Archive -Path staging\* -DestinationPath muc-server-windows-x64.zip
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             muc-server-linux-amd64.tar.gz
-            muc-server-windows-amd64.zip
+            muc-server-windows-x64.zip
