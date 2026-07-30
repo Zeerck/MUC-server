@@ -17,34 +17,19 @@ impl Command {
     }
 }
 
-pub fn handle_command(stream: &TcpStream, command: Command) -> bool {
+pub fn handle_command<W: Write>(stream: &mut W, command: Command) -> bool {
     match command {
         Command::Ping => {
-            match stream.try_clone() {
-                Ok(cloned) => ping_handler(cloned),
-                Err(e) => error!("Failed to clone stream for PING: {e}"),
+            if let Err(e) = stream.write_all(b"Server: PONG\n") {
+                error!("Failed to write PING: {e}");
             };
             true
         }
         Command::Exit => { 
-            match stream.try_clone() {
-                Ok(cloned) => exit_handler(cloned),
-                Err(e) => error!("Failed to clone stream for EXIT: {e}"),
+            if let Err(e) = stream.write_all(b"Disconnected from server\n") {
+                error!("Failed to write EXIT: {e}");
             };
             false
         }
-    }
-}
-
-fn ping_handler(mut stream: TcpStream) {
-    trace!("Server received PING command");
-    let _ = stream.write_all(b"Server: PONG\n");
-}
-
-fn exit_handler(mut stream: TcpStream) {
-    trace!("Server received EXIT command");
-    let _ = stream.write_all(b"Disconnected from server\n");
-    if let Err(e) = stream.shutdown(std::net::Shutdown::Both) {
-        error!("Failed to shutdown stream: {e}");
     }
 }

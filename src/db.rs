@@ -30,7 +30,7 @@ pub fn init_database(path: &Path) -> Result<Connection> {
 /// Возвращает путь к файлу БД, создавая все нужные папки.
 /// Для Windows использует `%APPDATA%/LocalLow/Zeerck Inc/<app_name>/db/database.sqlite`
 /// Для других ОС – `$XDG_DATA_HOME/zeerck-inc/<app_name>/db/database.sqlite`
-pub fn get_db_path(app_name: &str) -> Result<PathBuf> {
+pub fn get_db_path() -> Result<PathBuf> {
     let base_dir = if cfg!(target_os = "windows") {
         let appdata = std::env::var("APPDATA")
             .context("APPDATA not set")?;
@@ -44,7 +44,7 @@ pub fn get_db_path(app_name: &str) -> Result<PathBuf> {
             PathBuf::from(home).join(".local/share")
         }
     };
-    let db_dir = base_dir.join("Zeerck Inc").join(app_name).join("db");
+    let db_dir = base_dir.join("Zeerck Inc").join("MUC-server").join("db");
     Ok(db_dir.join("database.sqlite"))
 }
 
