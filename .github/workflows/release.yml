@@ -26,14 +26,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p staging
-          cp target/release/muc-server staging/
+          cp target/release/MUC-server staging/
           tar -czf muc-server-linux-amd64.tar.gz -C staging .
 
       - name: Prepare artifacts (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           mkdir staging
-          copy target\release\muc-server.exe staging\
+          copy target\release\MUC-server.exe staging\
           Compress-Archive -Path staging\* -DestinationPath muc-server-windows-amd64.zip
 
       - name: Upload to Release
