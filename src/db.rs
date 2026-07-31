@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use zxcvbn::Score;
 use std::{fs, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
 use uuid::{Uuid};
 use argon2::{
@@ -16,27 +17,20 @@ pub struct User {
     pub created_at: DateTime<Local>,
 }
 
-/// Инициализирует пул соединений с SQLite (файл или in-memory)
 pub fn init_database(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
     Ok(conn)
 }
 
-/// Возвращает путь к файлу БД, создавая все нужные папки.
-/// Для Windows использует `%APPDATA%/LocalLow/Zeerck Inc/<app_name>/db/database.sqlite`
-/// Для других ОС – `$XDG_DATA_HOME/zeerck-inc/<app_name>/db/database.sqlite`
 pub fn get_db_path() -> Result<PathBuf> {
     let base_dir = if cfg!(target_os = "windows") {
-        let appdata = std::env::var("APPDATA")
-            .context("APPDATA not set")?;
+        let appdata = std::env::var("APPDATA").context("APPDATA not set")?;
         PathBuf::from(appdata.replace("Roaming", "LocalLow"))
     } else {
-        // Unix: XDG_DATA_HOME или ~/.local/share
         if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
             PathBuf::from(xdg)
         } else {
@@ -48,7 +42,6 @@ pub fn get_db_path() -> Result<PathBuf> {
     Ok(db_dir.join("database.sqlite"))
 }
 
-/// Создаёт таблицу users, если она не существует
 pub fn migrate(connection: &Connection) -> Result<()> {
     connection.execute(
         r#"
@@ -61,14 +54,18 @@ pub fn migrate(connection: &Connection) -> Result<()> {
         "#,
         params![],
     )?;
-
     Ok(())
 }
 
-/// Добавляет нового пользователя в базу
 pub fn add_user(connection: &Connection, login: &str, raw_password: &str) -> Result<User> {
     if !validate_login(login) {
         anyhow::bail!("invalid login: must be 3-32 letters, numbers or underscores");
+    }
+
+    // Серверная проверка сложности пароля
+    let entropy = zxcvbn::zxcvbn(raw_password, &[]);
+    if entropy.score() < Score::Two {
+        anyhow::bail!("password is too weak");
     }
 
     let id = Uuid::new_v4();
@@ -89,39 +86,24 @@ pub fn add_user(connection: &Connection, login: &str, raw_password: &str) -> Res
     Ok(user)
 }
 
-/// Получает пользователя по никнейму
 pub fn get_user_by_login(connection: &Connection, login: &str) -> Result<Option<User>> {
-    let mut stmt = connection
-        .prepare("SELECT id, login, password, created_at FROM users WHERE login = ?")?;
-    let user = stmt
-        .query_row(params![login], map_row_to_user)
-        .optional()?;
-
+    let mut stmt = connection.prepare("SELECT id, login, password, created_at FROM users WHERE login = ?")?;
+    let user = stmt.query_row(params![login], map_row_to_user).optional()?;
     Ok(user)
 }
 
-/// Получает пользователя по адресу
 pub fn get_user_by_id(connection: &Connection, id: Uuid) -> Result<Option<User>> {
-    let mut stmt = connection
-        .prepare("SELECT id, login, password, created_at FROM users WHERE id = ?")?;
-    let user = stmt
-        .query_row(params![&id], map_row_to_user)
-        .optional()?;
-
+    let mut stmt = connection.prepare("SELECT id, login, password, created_at FROM users WHERE id = ?")?;
+    let user = stmt.query_row(params![&id], map_row_to_user).optional()?;
     Ok(user)
 }
 
-/// Возвращает всех пользователей в базе
 pub fn get_all_users(connection: &Connection) -> Result<Vec<User>> {
-    let mut stmt = connection
-        .prepare("SELECT id, login, password, created_at FROM users ORDER BY created_at")?;
-    let users = stmt
-        .query_map([], map_row_to_user)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut stmt = connection.prepare("SELECT id, login, password, created_at FROM users ORDER BY created_at")?;
+    let users = stmt.query_map([], map_row_to_user)?.collect::<Result<Vec<_>, _>>()?;
     Ok(users)
 }
 
-/// Удаляет пользователя по ID
 pub fn delete_user(connection: &Connection, id: &Uuid) -> Result<bool> {
     let rows = connection.execute("DELETE FROM users where id = ?", params![id])?;
     Ok(rows > 0)
@@ -132,9 +114,7 @@ pub fn validate_login(nick: &str) -> bool {
     if len < 3 || len > 32 {
         return false;
     }
-
-    nick.chars()
-        .all(|char| char.is_ascii_alphanumeric() || char == '_')
+    nick.chars().all(|char| char.is_ascii_alphanumeric() || char == '_')
 }
 
 fn map_row_to_user(row: &Row) -> rusqlite::Result<User> {
@@ -151,19 +131,14 @@ fn map_row_to_user(row: &Row) -> rusqlite::Result<User> {
     };
     let created_at = dt_utc.with_timezone(&Local);
 
-    Ok(User {
-        id,
-        login,
-        password,
-        created_at,
-    })
+    Ok(User { id, login, password, created_at })
 }
 
-fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+// Делаем публичной, чтобы сгенерировать фейковый хэш при старте сервера
+pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let password_hash = argon2.hash_password(password.as_bytes(), &salt)?;
-
     Ok(password_hash.to_string())
 }
 
@@ -172,7 +147,6 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
-
     Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok()
 }
 
@@ -186,7 +160,7 @@ mod tests {
         migrate(&conn)?;
 
         let login = "Alice";
-        let password = "best_password_123";
+        let password = "best_password_123_A!";
 
         let user = add_user(&conn, login, &password)?;
         assert!(!user.id.is_nil());
@@ -195,7 +169,6 @@ mod tests {
         assert!(fetched.is_some());
         let user = fetched.unwrap();
         assert_eq!(user.login, login);
-        assert_eq!(user.login, login.to_string());
 
         let all = get_all_users(&conn)?;
         assert_eq!(all.len(), 1);

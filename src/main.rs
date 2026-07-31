@@ -7,12 +7,14 @@ use commands::Command;
 use dotenvy::dotenv;
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     str::from_utf8,
     sync::{Arc, LazyLock, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
@@ -34,6 +36,44 @@ struct HandshakeData {
     login: String,
     password: String,
     address: SocketAddr,
+}
+
+// Простая структура для Rate Limiting
+struct RateLimiter {
+    attempts: HashMap<IpAddr, Vec<Instant>>,
+    window: Duration,
+    max_attempts: usize,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            attempts: HashMap::new(),
+            window: Duration::from_secs(300), // 5 минут
+            max_attempts: 5,
+        }
+    }
+
+    fn is_blocked(&self, ip: &IpAddr) -> bool {
+        if let Some(times) = self.attempts.get(ip) {
+            let now = Instant::now();
+            let recent: Vec<_> = times.iter().filter(|&&t| now.duration_since(t) < self.window).collect();
+            return recent.len() >= self.max_attempts;
+        }
+        false
+    }
+
+    fn record_failure(&mut self, ip: IpAddr) {
+        let now = Instant::now();
+        let times = self.attempts.entry(ip).or_insert_with(Vec::new);
+        times.push(now);
+        // Чистим старые записи, чтобы не течь по памяти
+        times.retain(|&t| now.duration_since(t) < self.window);
+    }
+
+    fn clear_attempts(&mut self, ip: &IpAddr) {
+        self.attempts.remove(ip);
+    }
 }
 
 fn load_tls_config() -> Arc<ServerConfig> {
@@ -78,14 +118,23 @@ fn main() {
 
     let db_arc = Arc::new(Mutex::new(connection));
     let tls_config = load_tls_config();
+    
+    // Генерируем фейковый хэш для защиты от Timing Attacks
+    let fake_hash = db::hash_password("fake_password_for_timing_attack").expect("Failed to generate fake hash");
+    let fake_hash_arc = Arc::new(fake_hash);
+    
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
 
     for stream_result in listener.incoming() {
         match stream_result {
             Ok(stream) => {
                 let db_clone = db_arc.clone();
                 let tls_config_clone = tls_config.clone();
+                let fake_hash_clone = fake_hash_arc.clone();
+                let rate_limiter_clone = rate_limiter.clone();
+                
                 thread::spawn(move || {
-                    handle_client(stream, db_clone, tls_config_clone);
+                    handle_client(stream, db_clone, tls_config_clone, fake_hash_clone, rate_limiter_clone);
                 });
             }
             Err(e) => {
@@ -95,7 +144,13 @@ fn main() {
     }
 }
 
-fn handle_client(mut stream: TcpStream, db: Arc<Mutex<rusqlite::Connection>>, tls_config: Arc<ServerConfig>) {
+fn handle_client(
+    mut stream: TcpStream, 
+    db: Arc<Mutex<rusqlite::Connection>>, 
+    tls_config: Arc<ServerConfig>,
+    fake_hash: Arc<String>,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+) {
     let peer_address = match stream.peer_addr() {
         Ok(address) => address,
         Err(e) => {
@@ -103,6 +158,19 @@ fn handle_client(mut stream: TcpStream, db: Arc<Mutex<rusqlite::Connection>>, tl
             return;
         }
     };
+
+    let peer_ip = peer_address.ip();
+
+    // 0. Rate Limit Check
+    {
+        let limiter = rate_limiter.lock().unwrap();
+        if limiter.is_blocked(&peer_ip) {
+            warning!("Connection from {peer_address} blocked due to rate limit");
+            // Просто рвем соединение без объяснений
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
+    }
 
     trace!("Handling connection from: {peer_address}");
 
@@ -139,16 +207,22 @@ fn handle_client(mut stream: TcpStream, db: Arc<Mutex<rusqlite::Connection>>, tl
 
     let user_result = match user_handshake_data.auth_type {
         AuthType::Register => register_user(&connection, &user_handshake_data.login, &user_handshake_data.password, peer_address),
-        AuthType::Login => login_user(&connection, &user_handshake_data.login, &user_handshake_data.password, peer_address),
+        AuthType::Login => login_user(&connection, &user_handshake_data.login, &user_handshake_data.password, peer_address, &fake_hash),
     };
 
     let user = match user_result {
         Ok(u) => {
             info!("User '{}' successfully authenticated", u.login);
+            // Сбрасываем счетчик неудачных попыток при успехе
+            rate_limiter.lock().unwrap().clear_attempts(&peer_ip);
             u
         }
         Err(err_msg) => {
             warning!("Authentication failed for {peer_address}: {}", err_msg);
+            // Записываем неудачную попытку
+            rate_limiter.lock().unwrap().record_failure(peer_ip);
+            
+            // Отправляем универсальную ошибку клиенту
             let _ = tls_stream.write_all(format!("{}\n", err_msg).as_bytes());
             let _ = tls_stream.flush();
             let _ = tls_stream.sock.shutdown(Shutdown::Both);
@@ -203,14 +277,22 @@ fn register_user(
     address: SocketAddr,
 ) -> Result<db::User, String> {
     trace!("Checking if user exists in database...");
-    if db::get_user_by_login(connection, login).map_err(|e| e.to_string())?.is_some() {
-        return Err("Login already taken! Disconnecting.".to_string());
+    
+    // Проверяем сложность пароля до проверки существования логина,
+    // чтобы не выдавать, занят логин или нет, если пароль все равно мусор.
+    match db::add_user(connection, login, password) {
+        Ok(user) => {
+            trace!("User inserted with ID: '{}' and login '{}'", user.id, user.login);
+            Ok(user)
+        }
+        Err(e) => {
+            // Если ошибка из-за уникальности логина (SQLite возвращает SQLITE_CONSTRAINT_UNIQUE)
+            // или из-за слабого пароля, мы возвращаем одинаковую нейтральную ошибку.
+            // Не светим, что именно пошло не так.
+            warning!("Registration failed for '{}': {}", login, e);
+            Err("Registration failed. Check login format and password strength.".to_string())
+        }
     }
-
-    trace!("Trying add user with login: '{login}' and address: {address} to Database...");
-    let user = db::add_user(connection, login, password).map_err(|e| e.to_string())?;
-    trace!("User inserted with ID: '{}' and login '{}'", user.id, user.login);
-    Ok(user)
 }
 
 fn login_user(
@@ -218,13 +300,20 @@ fn login_user(
     login: &str,
     password: &str,
     address: SocketAddr,
+    fake_hash: &str,
 ) -> Result<db::User, String> {
-    trace!("Trying to find user '{login}' ({address}) in Database...");
+    trace!("Trying to find user '{login}' ({address}) in database...");
 
     if let Some(existing) = db::get_user_by_login(connection, login).map_err(|e| e.to_string())? {
         if db::verify_password(password, &existing.password) {
             return Ok(existing);
         }
+    } else {
+        // TIMING ATTACK MITIGATION
+        // Если логина нет в базе, мы всё равно вызываем verify_password для фейкового хэша.
+        // Это занимает те же ~50-100мс, что и проверка реального пароля.
+        // Атакующий не сможет понять по времени ответа, существует ли логин.
+        let _ = db::verify_password(password, fake_hash);
     }
 
     Err("Wrong login or password! Disconnecting.".to_string())

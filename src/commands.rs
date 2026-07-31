@@ -1,5 +1,5 @@
-use std::{io::Write, net::TcpStream};
-use crate::{error, trace};
+use std::{io::Write};
+use crate::{error};
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
