@@ -62,7 +62,6 @@ pub fn add_user(connection: &Connection, login: &str, raw_password: &str) -> Res
         anyhow::bail!("invalid login: must be 3-32 letters, numbers or underscores");
     }
 
-    // Серверная проверка сложности пароля
     let entropy = zxcvbn::zxcvbn(raw_password, &[]);
     if entropy.score() < Score::Two {
         anyhow::bail!("password is too weak");
@@ -134,7 +133,6 @@ fn map_row_to_user(row: &Row) -> rusqlite::Result<User> {
     Ok(User { id, login, password, created_at })
 }
 
-// Делаем публичной, чтобы сгенерировать фейковый хэш при старте сервера
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();

@@ -38,7 +38,6 @@ struct HandshakeData {
     address: SocketAddr,
 }
 
-// Простая структура для Rate Limiting
 struct RateLimiter {
     attempts: HashMap<IpAddr, Vec<Instant>>,
     window: Duration,
@@ -49,7 +48,7 @@ impl RateLimiter {
     fn new() -> Self {
         Self {
             attempts: HashMap::new(),
-            window: Duration::from_secs(300), // 5 минут
+            window: Duration::from_secs(300),
             max_attempts: 5,
         }
     }
@@ -67,7 +66,6 @@ impl RateLimiter {
         let now = Instant::now();
         let times = self.attempts.entry(ip).or_insert_with(Vec::new);
         times.push(now);
-        // Чистим старые записи, чтобы не течь по памяти
         times.retain(|&t| now.duration_since(t) < self.window);
     }
 
@@ -119,7 +117,6 @@ fn main() {
     let db_arc = Arc::new(Mutex::new(connection));
     let tls_config = load_tls_config();
     
-    // Генерируем фейковый хэш для защиты от Timing Attacks
     let fake_hash = db::hash_password("fake_password_for_timing_attack").expect("Failed to generate fake hash");
     let fake_hash_arc = Arc::new(fake_hash);
     
@@ -161,12 +158,10 @@ fn handle_client(
 
     let peer_ip = peer_address.ip();
 
-    // 0. Rate Limit Check
     {
         let limiter = rate_limiter.lock().unwrap();
         if limiter.is_blocked(&peer_ip) {
             warning!("Connection from {peer_address} blocked due to rate limit");
-            // Просто рвем соединение без объяснений
             let _ = stream.shutdown(Shutdown::Both);
             return;
         }
@@ -213,16 +208,13 @@ fn handle_client(
     let user = match user_result {
         Ok(u) => {
             info!("User '{}' successfully authenticated", u.login);
-            // Сбрасываем счетчик неудачных попыток при успехе
             rate_limiter.lock().unwrap().clear_attempts(&peer_ip);
             u
         }
         Err(err_msg) => {
             warning!("Authentication failed for {peer_address}: {}", err_msg);
-            // Записываем неудачную попытку
             rate_limiter.lock().unwrap().record_failure(peer_ip);
             
-            // Отправляем универсальную ошибку клиенту
             let _ = tls_stream.write_all(format!("{}\n", err_msg).as_bytes());
             let _ = tls_stream.flush();
             let _ = tls_stream.sock.shutdown(Shutdown::Both);
@@ -278,17 +270,12 @@ fn register_user(
 ) -> Result<db::User, String> {
     trace!("Checking if user exists in database...");
     
-    // Проверяем сложность пароля до проверки существования логина,
-    // чтобы не выдавать, занят логин или нет, если пароль все равно мусор.
     match db::add_user(connection, login, password) {
         Ok(user) => {
             trace!("User inserted with ID: '{}' and login '{}'", user.id, user.login);
             Ok(user)
         }
         Err(e) => {
-            // Если ошибка из-за уникальности логина (SQLite возвращает SQLITE_CONSTRAINT_UNIQUE)
-            // или из-за слабого пароля, мы возвращаем одинаковую нейтральную ошибку.
-            // Не светим, что именно пошло не так.
             warning!("Registration failed for '{}': {}", login, e);
             Err("Registration failed. Check login format and password strength.".to_string())
         }
@@ -309,10 +296,6 @@ fn login_user(
             return Ok(existing);
         }
     } else {
-        // TIMING ATTACK MITIGATION
-        // Если логина нет в базе, мы всё равно вызываем verify_password для фейкового хэша.
-        // Это занимает те же ~50-100мс, что и проверка реального пароля.
-        // Атакующий не сможет понять по времени ответа, существует ли логин.
         let _ = db::verify_password(password, fake_hash);
     }
 
@@ -324,23 +307,39 @@ fn get_user_handshake_data<S: Read + Write>(
     address: SocketAddr,
 ) -> Result<HandshakeData, String> {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut raw_buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
 
-    match reader.read_line(&mut line) {
-        Ok(0) => return Err("Client disconnected before sending handshake\n".to_string()),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err("Handshake timeout\n".to_string()),
-        Err(e) => return Err(format!("Failed to read handshake: {}\n", e)),
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return Err("Client disconnected before sending handshake\n".to_string()),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                raw_buf.push(byte[0]);
+                if raw_buf.len() > 1024 {
+                    return Err("Handshake payload too large\n".to_string());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err("Handshake timeout\n".to_string()),
+            Err(e) => return Err(format!("Failed to read handshake: {}\n", e)),
+        }
     }
 
-    let line = line.trim();
+    let line = String::from_utf8_lossy(&raw_buf).trim().to_string();
+    
+    if line.is_empty() {
+        return Err("Empty handshake\n".to_string());
+    }
+
     trace!("Received handshake: {}", line);
 
     let mut parts = line.splitn(3, ' ');
     
-    let cmd = parts.next().ok_or("Empty handshake\n".to_string())?;
-    let login = parts.next().ok_or("Missing login in handshake\n".to_string())?;
-    let password = parts.next().ok_or("Missing password in handshake\n".to_string())?;
+    let cmd = parts.next().ok_or("Missing command\n".to_string())?;
+    let login = parts.next().ok_or("Missing login\n".to_string())?;
+    let password = parts.next().ok_or("Missing password\n".to_string())?;
 
     let auth_type = match cmd.to_uppercase().as_str() {
         "REGISTER" => AuthType::Register,
