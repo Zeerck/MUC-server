@@ -7,6 +7,9 @@ CONFIG_DIR="/etc/muc-server"
 DATA_DIR="/var/lib/muc-server"
 SERVICE_FILE="/etc/systemd/system/muc-server.service"
 ENV_FILE="$CONFIG_DIR/muc-server.env"
+BIN_FILE="$INSTALL_DIR/MUC-server"
+
+REQUIRED_VARS=("TLS_CERT_PATH" "TLS_KEY_PATH")
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -14,36 +17,28 @@ YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'
 NC=$'\033[0m'
 
-print_message() {
-    echo -e "${GREEN}[+]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}[-]${NC} $1"
-}
+print_message() { echo -e "${GREEN}[+]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
+print_error() { echo -e "${RED}[-]${NC} $1"; }
 
 grant_cert_access() {
     local file_path="$1"
     local real_path=$(readlink -f "$file_path")
 
     if ! command -v setfacl &> /dev/null; then
-        print_error "'setfacl' package not found. Installing with: apt install acl..."
-        apt install acl
+        print_error "'setfacl' package not found. Installing with: apt install acl -y..."
+        apt install acl -y
     fi
 
     setfacl -m u:"$APP_USER":r "$real_path" 2>/dev/null || {
-        print_error "Cannot grand rights for file: $real_path"
+        print_error "Cannot grant rights for file: $real_path"
         exit 1
     }
 
     local dir_path=$(dirname "$real_path")
     while [ "$dir_path" != "/" ]; do
         setfacl -m u:"$APP_USER":x "$dir_path" 2>/dev/null || {
-            print_error "Cannot grand rights for directory: $dir_path"
+            print_error "Cannot grant rights for directory: $dir_path"
             exit 1
         }
         dir_path=$(dirname "$dir_path")
@@ -57,30 +52,120 @@ if [ "$1" == "--remove" ]; then
     systemctl disable muc-server 2>/dev/null
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
-    
     rm -rf "$INSTALL_DIR"
     
-    printf "%s[?]%s Do you want do delete configs, database and settings? (y/n): " "$YELLOW" "$NC"
+    printf "%s[?]%s Do you want to delete configs, database and settings? (y/n): " "$YELLOW" "$NC"
     read del_data
     if [[ "$del_data" =~ ^[Yy]$ ]]; then
         rm -rf "$CONFIG_DIR" "$DATA_DIR"
         userdel "$APP_USER" 2>/dev/null
-        print_message "MUC-server deleted completly."
+        print_message "MUC-server deleted completely."
     else
-        print_message "MUC-server deleted. Configs and setting saved in $DATA_DIR and $CONFIG_DIR"
+        print_message "MUC-server deleted. Configs and settings saved in $DATA_DIR and $CONFIG_DIR"
     fi
     exit 0
 fi
 
 if [ "$EUID" -ne 0 ]; then
-    print_error "Please run this script using `sudo bash muc-server-installer.sh`"
+    print_error "Please run this script using: sudo bash muc-server-installer.sh"
     exit 1
+fi
+
+if [ -f "$SERVICE_FILE" ]; then
+    print_warning "MUC-server is already installed. Starting UPDATE mode..."
+    
+    for var in "${REQUIRED_VARS[@]}"; do
+        if ! grep -q "^${var}=." "$ENV_FILE"; then
+            print_warning "New required variable detected: $var"
+            
+            if [[ "$var" == *"PATH"* ]]; then
+                while true; do
+                    printf "%s[?]%s Enter path for %s: " "$YELLOW" "$NC" "$var"
+                    read val
+                    if [ -f "$val" ]; then
+                        grant_cert_access "$val"
+                        break
+                    else
+                        print_error "File not found. Try again."
+                    fi
+                done
+            else
+                printf "%s[?]%s Enter value for %s: " "$YELLOW" "$NC" "$var"
+                read val
+            fi
+            echo "${var}=${val}" >> "$ENV_FILE"
+            print_message "Added $var to $ENV_FILE"
+        fi
+    done
+
+    print_message "Verifying certificate permissions..."
+    CURRENT_CERT=$(grep "^TLS_CERT_PATH=" "$ENV_FILE" | cut -d'=' -f2)
+    CURRENT_KEY=$(grep "^TLS_KEY_PATH=" "$ENV_FILE" | cut -d'=' -f2)
+    
+    if [ -n "$CURRENT_CERT" ] && [ -f "$CURRENT_CERT" ]; then
+        grant_cert_access "$CURRENT_CERT"
+    fi
+    if [ -n "$CURRENT_KEY" ] && [ -f "$CURRENT_KEY" ]; then
+        grant_cert_access "$CURRENT_KEY"
+    fi
+    print_message "Certificate permissions verified."
+
+    print_message "Stopping service for update..."
+    systemctl stop muc-server
+    
+    print_message "Backing up old binary..."
+    cp "$BIN_FILE" "${BIN_FILE}.bak"
+    
+    print_message "Downloading latest release..."
+    if ! command -v wget &> /dev/null; then
+        print_error "'wget' package not found. Installing..."
+        apt install wget -y
+    fi
+    
+    wget -qO /tmp/muc-server.tar.gz "$DOWNLOAD_URL"
+    if [ $? -ne 0 ]; then
+        print_error "Error while downloading. Check URL: $DOWNLOAD_URL"
+        rm -f /tmp/muc-server.tar.gz
+        exit 1
+    fi
+    
+    tar -xzf /tmp/muc-server.tar.gz -C "$INSTALL_DIR"
+    rm /tmp/muc-server.tar.gz
+    
+    if [ ! -f "$BIN_FILE" ]; then
+        BIN_FILE=$(find "$INSTALL_DIR" -type f -name "MUC-server" | head -n 1)
+    fi
+    
+    if [ -z "$BIN_FILE" ]; then
+        print_error "MUC-server binary file not found in archive! Restoring backup."
+        mv "${BIN_FILE}.bak" "$BIN_FILE"
+        exit 1
+    fi
+    
+    chmod +x "$BIN_FILE"
+    chown -R "$APP_USER":"$APP_USER" "$INSTALL_DIR"
+    
+    print_message "Starting updated service..."
+    systemctl start muc-server
+    sleep 3
+    
+    if systemctl is-active --quiet muc-server; then
+        print_message "Update complete! Backup removed."
+        rm -f "${BIN_FILE}.bak"
+    else
+        print_error "Service failed to start after update!"
+        print_error "Restoring previous binary..."
+        mv "${BIN_FILE}.bak" "$BIN_FILE"
+        systemctl start muc-server
+        print_warning "Rolled back to previous version. Please check logs: journalctl -u muc-server -e"
+    fi
+    exit 0
 fi
 
 print_message "Installing MUC-server..."
 
 if id "$APP_USER" &>/dev/null; then
-    print_warning "user $APP_USER already exist. Skipping creating new user."
+    print_warning "User $APP_USER already exists. Skipping creating new user."
 else
     useradd -r -s /bin/false "$APP_USER"
     print_message "Created system user: $APP_USER."
@@ -91,30 +176,22 @@ mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
 echo -e "${CYAN}=== Server settings ===${NC}"
 
 while true; do
-    printf "%s[?]%s Enter path with .cert file of domain (TLS_CERT_PATH): " "$YELLOW" "$NC"
+    printf "%s[?]%s Enter path to .cert file of domain (TLS_CERT_PATH): " "$YELLOW" "$NC"
     read tls_cert
-    if [ -f "$tls_cert" ]; then
-        break
-    else
-        print_error "File .cert not found. Try again."
-    fi
+    if [ -f "$tls_cert" ]; then break; else print_error "File .cert not found. Try again."; fi
 done
 
 while true; do
-    printf "%s[?]%s Enter path with .key file of domain (TLS_KEY_PATH): " "$YELLOW" "$NC"
+    printf "%s[?]%s Enter path to .key file of domain (TLS_KEY_PATH): " "$YELLOW" "$NC"
     read tls_key
-    if [ -f "$tls_key" ]; then
-        break
-    else
-        print_error "File .key not found. Try again."
-    fi
+    if [ -f "$tls_key" ]; then break; else print_error "File .key not found. Try again."; fi
 done
 
 printf "%s[?]%s Server address:port [0.0.0.0:1990]: " "$YELLOW" "$NC"
 read server_addr
 server_addr=${server_addr:-"0.0.0.0:1990"}
 
-printf "%s[?]%s Path where DB will placed [/var/lib/muc-server/database.sqlite]: " "$YELLOW" "$NC"
+printf "%s[?]%s Path where DB will be placed [/var/lib/muc-server/database.sqlite]: " "$YELLOW" "$NC"
 read db_path
 db_path=${db_path:-"/var/lib/muc-server/database.sqlite"}
 
@@ -126,12 +203,12 @@ printf "%s[?]%s Handshake timeout [10]: " "$YELLOW" "$NC"
 read handshake_timeout
 handshake_timeout=${handshake_timeout:-"10"}
 
-print_message "Setting up rights to reading .cert and .key files for $APP_USER..."
+print_message "Setting up rights to read .cert and .key files for $APP_USER..."
 grant_cert_access "$tls_cert"
 grant_cert_access "$tls_key"
-print_message "Right to read .cert and .key successfully granded"
+print_message "Rights to read .cert and .key successfully granted"
 
-print_message "Config generating... $ENV_FILE..."
+print_message "Config generating... $ENV_FILE"
 cat <<EOF > "$ENV_FILE"
 SERVER_ADDRESS=$server_addr
 DB_PATH=$db_path
@@ -145,10 +222,10 @@ EOF
 chmod 640 "$ENV_FILE"
 chown root:"$APP_USER" "$ENV_FILE"
 
-print_message "Donwloading latest release of server from GitHub..."
+print_message "Downloading latest release of server from GitHub..."
 if ! command -v wget &> /dev/null; then
-    print_error "`wget` package not found. Installing with `apt install wget`"
-    apt install wget
+    print_error "'wget' package not found. Installing with: apt install wget -y"
+    apt install wget -y
 fi
 
 wget -qO /tmp/muc-server.tar.gz "$DOWNLOAD_URL"
@@ -160,7 +237,6 @@ fi
 tar -xzf /tmp/muc-server.tar.gz -C "$INSTALL_DIR"
 rm /tmp/muc-server.tar.gz
 
-BIN_FILE="$INSTALL_DIR/MUC-server"
 if [ ! -f "$BIN_FILE" ]; then
     BIN_FILE=$(find "$INSTALL_DIR" -type f -name "MUC-server" | head -n 1)
 fi
@@ -203,8 +279,8 @@ systemctl daemon-reload
 systemctl enable muc-server
 systemctl start muc-server
 
-print_message "Installing complete!"
+print_message "Installation complete!"
 echo -e "${CYAN}========================================${NC}"
 systemctl status muc-server --no-pager
 echo -e "${CYAN}========================================${NC}"
-print_warning "If service not launch, check logs: journalctl -u muc-server -e"
+print_warning "If the service did not launch, check logs: journalctl -u muc-server -e"

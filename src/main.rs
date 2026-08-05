@@ -9,7 +9,7 @@ use dotenvy::dotenv;
 use std::{
     collections::HashMap,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufReader, Read, Write},
     net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream},
     str::from_utf8,
     sync::{Arc, LazyLock, Mutex},
@@ -332,8 +332,6 @@ fn get_user_handshake_data<S: Read + Write>(
     if line.is_empty() {
         return Err("Empty handshake\n".to_string());
     }
-
-    trace!("Received handshake: {}", line);
 
     let mut parts = line.splitn(3, ' ');
     

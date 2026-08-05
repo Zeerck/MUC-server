@@ -15,7 +15,7 @@ impl Config {
     pub fn from_env() -> Self {
         let server_address = env::var("SERVER_ADDRESS")
             .unwrap_or_else(|_| {
-                trace!("Environment parameter 'SERVER_ADDRESS' not found. Default address and port are being used: 0.0.0.0:1990.");
+                trace!("Environment parameter 'SERVER_ADDRESS' not found. Default address and port are being used: 0.0.0.0:1990");
                 "0.0.0.0:1990".to_string()
             });
 
