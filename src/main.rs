@@ -415,10 +415,11 @@ fn verify_pow(challenge: &str, nonce: u64, difficulty: usize) -> bool {
     hasher.update(challenge.as_bytes());
     hasher.update(nonce.to_string().as_bytes());
     let result = hasher.finalize();
-
-    let mut hex_str = String::new();
-    for byte in result {
-        hex_str.push_str(&format!("{:02x}", byte));
+    
+    match difficulty {
+        4 => result[30] == 0 && result[31] == 0,
+        5 => result[30] == 0 && result[31] == 0 && result[29] < 0x10,
+        6 => result[29] == 0 && result[30] == 0 && result[31] == 0,
+        _ => false,
     }
-    hex_str.ends_with(&"0".repeat(difficulty))
 }
