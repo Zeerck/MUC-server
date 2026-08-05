@@ -9,6 +9,7 @@ pub struct Config {
     pub handshake_timeout: Duration,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
+    pub pow_difficulty: usize,
 }
 
 impl Config {
@@ -46,6 +47,18 @@ impl Config {
             .map(PathBuf::from)
             .expect("TLS_KEY_PATH variable is required");
 
+        let bot_secure_level = env::var("POW_DIFFICULTY")
+            .unwrap_or_else(|_| {
+                trace!("Environment parameter 'POW_DIFFICULTY' not found. Default value will be used: medium");
+                "medium".to_string()
+            });
+        let pow_difficulty = match bot_secure_level.to_lowercase().as_str() {
+            "weak" => 4,
+            "medium" => 5,
+            "strong" => 6,
+            _ => 5,
+        };
+
         Self {
             server_address,
             db_path,
@@ -53,6 +66,7 @@ impl Config {
             handshake_timeout,
             tls_cert_path,
             tls_key_path,
+            pow_difficulty,
         }
     }
 }

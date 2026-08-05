@@ -17,8 +17,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use rand::{Rng, RngExt};
+use rustls::{ServerConfig, client::AlwaysResolvesClientRawPublicKeys};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use sha2::{Digest, Sha256};
 
 use crate::{commands::handle_command, config::Config};
 
@@ -56,7 +58,10 @@ impl RateLimiter {
     fn is_blocked(&self, ip: &IpAddr) -> bool {
         if let Some(times) = self.attempts.get(ip) {
             let now = Instant::now();
-            let recent: Vec<_> = times.iter().filter(|&&t| now.duration_since(t) < self.window).collect();
+            let recent: Vec<_> = times
+                .iter()
+                .filter(|&&t| now.duration_since(t) < self.window)
+                .collect();
             return recent.len() >= self.max_attempts;
         }
         false
@@ -75,15 +80,17 @@ impl RateLimiter {
 }
 
 fn load_tls_config() -> Arc<ServerConfig> {
-    let cert_file = &mut BufReader::new(File::open(&CONFIG.tls_cert_path).expect("Failed to open cert file"));
-    let key_file = &mut BufReader::new(File::open(&CONFIG.tls_key_path).expect("Failed to open key file"));
+    let cert_file =
+        &mut BufReader::new(File::open(&CONFIG.tls_cert_path).expect("Failed to open cert file"));
+    let key_file =
+        &mut BufReader::new(File::open(&CONFIG.tls_key_path).expect("Failed to open key file"));
 
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<_, _>>()
         .expect("Failed to parse certs");
-        
-    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(key_file)
-        .expect("Failed to parse key");
+
+    let key: PrivateKeyDer<'static> =
+        PrivateKeyDer::from_pem_reader(key_file).expect("Failed to parse key");
 
     let config = ServerConfig::builder()
         .with_no_client_auth()
@@ -116,10 +123,11 @@ fn main() {
 
     let db_arc = Arc::new(Mutex::new(connection));
     let tls_config = load_tls_config();
-    
-    let fake_hash = db::hash_password("fake_password_for_timing_attack").expect("Failed to generate fake hash");
+
+    let fake_hash =
+        db::hash_password("fake_password_for_timing_attack").expect("Failed to generate fake hash");
     let fake_hash_arc = Arc::new(fake_hash);
-    
+
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
 
     for stream_result in listener.incoming() {
@@ -129,9 +137,15 @@ fn main() {
                 let tls_config_clone = tls_config.clone();
                 let fake_hash_clone = fake_hash_arc.clone();
                 let rate_limiter_clone = rate_limiter.clone();
-                
+
                 thread::spawn(move || {
-                    handle_client(stream, db_clone, tls_config_clone, fake_hash_clone, rate_limiter_clone);
+                    handle_client(
+                        stream,
+                        db_clone,
+                        tls_config_clone,
+                        fake_hash_clone,
+                        rate_limiter_clone,
+                    );
                 });
             }
             Err(e) => {
@@ -142,8 +156,8 @@ fn main() {
 }
 
 fn handle_client(
-    mut stream: TcpStream, 
-    db: Arc<Mutex<rusqlite::Connection>>, 
+    mut stream: TcpStream,
+    db: Arc<Mutex<rusqlite::Connection>>,
     tls_config: Arc<ServerConfig>,
     fake_hash: Arc<String>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
@@ -201,8 +215,19 @@ fn handle_client(
     let connection = db.lock().unwrap();
 
     let user_result = match user_handshake_data.auth_type {
-        AuthType::Register => register_user(&connection, &user_handshake_data.login, &user_handshake_data.password, peer_address),
-        AuthType::Login => login_user(&connection, &user_handshake_data.login, &user_handshake_data.password, peer_address, &fake_hash),
+        AuthType::Register => register_user(
+            &connection,
+            &user_handshake_data.login,
+            &user_handshake_data.password,
+            peer_address,
+        ),
+        AuthType::Login => login_user(
+            &connection,
+            &user_handshake_data.login,
+            &user_handshake_data.password,
+            peer_address,
+            &fake_hash,
+        ),
     };
 
     let user = match user_result {
@@ -214,7 +239,7 @@ fn handle_client(
         Err(err_msg) => {
             warning!("Authentication failed for {peer_address}: {}", err_msg);
             rate_limiter.lock().unwrap().record_failure(peer_ip);
-            
+
             let _ = tls_stream.write_all(format!("{}\n", err_msg).as_bytes());
             let _ = tls_stream.flush();
             let _ = tls_stream.sock.shutdown(Shutdown::Both);
@@ -222,7 +247,9 @@ fn handle_client(
         }
     };
 
-    let _ = tls_stream.get_ref().set_read_timeout(Some(CONFIG.read_timeout));
+    let _ = tls_stream
+        .get_ref()
+        .set_read_timeout(Some(CONFIG.read_timeout));
 
     let user_login = user.login.clone();
     info!("User {user_login} ({peer_address}) entered main loop");
@@ -254,11 +281,11 @@ fn handle_client(
             }
         }
     }
-    
+
     let _ = tls_stream.conn.send_close_notify();
     let _ = tls_stream.flush();
     let _ = tls_stream.sock.shutdown(Shutdown::Both);
-    
+
     trace!("Connection finished for: {peer_address} ({user_login})");
 }
 
@@ -269,10 +296,13 @@ fn register_user(
     address: SocketAddr,
 ) -> Result<db::User, String> {
     trace!("Checking if user exists in database...");
-    
+
     match db::add_user(connection, login, password) {
         Ok(user) => {
-            trace!("User inserted with ID: '{}' and login '{}'", user.id, user.login);
+            trace!(
+                "User inserted with ID: '{}' and login '{}'",
+                user.id, user.login
+            );
             Ok(user)
         }
         Err(e) => {
@@ -306,35 +336,11 @@ fn get_user_handshake_data<S: Read + Write>(
     stream: &mut S,
     address: SocketAddr,
 ) -> Result<HandshakeData, String> {
-    let mut reader = BufReader::new(stream);
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut byte = [0u8; 1];
-
-    loop {
-        match reader.read(&mut byte) {
-            Ok(0) => return Err("Client disconnected before sending handshake\n".to_string()),
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                raw_buf.push(byte[0]);
-                if raw_buf.len() > 1024 {
-                    return Err("Handshake payload too large\n".to_string());
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err("Handshake timeout\n".to_string()),
-            Err(e) => return Err(format!("Failed to read handshake: {}\n", e)),
-        }
-    }
-
-    let line = String::from_utf8_lossy(&raw_buf).trim().to_string();
-    
-    if line.is_empty() {
-        return Err("Empty handshake\n".to_string());
-    }
+    let line = read_line_safe(stream)?;
+    let line = line.trim();
+    trace!("Received handshake: {}", line);
 
     let mut parts = line.splitn(3, ' ');
-    
     let cmd = parts.next().ok_or("Missing command\n".to_string())?;
     let login = parts.next().ok_or("Missing login\n".to_string())?;
     let password = parts.next().ok_or("Missing password\n".to_string())?;
@@ -345,10 +351,74 @@ fn get_user_handshake_data<S: Read + Write>(
         _ => return Err("Invalid handshake command\n".to_string()),
     };
 
+    if auth_type == AuthType::Register {
+        let challenge: String = (0..16)
+            .map(|_| format!("{:x}", rand::rng().random_range(0..16)))
+            .collect();
+        let difficulty = CONFIG.pow_difficulty;
+
+        stream
+            .write_all(format!("SOLVE {} {}\n", challenge, difficulty).as_bytes())
+            .map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())?;
+
+        let solve_line = read_line_safe(stream)?;
+        let solve_line = solve_line.trim();
+
+        if let Some(nonve_str) = solve_line.strip_prefix("SOLVED ") {
+            if let Ok(nonce) = nonve_str.parse::<u64>() {
+                if !verify_pow(&challenge, nonce, difficulty) {
+                    return Err("Invalid PoW solution\n".to_string());
+                }
+            } else {
+                return Err("Invalid PoW format\n".to_string());
+            }
+        } else {
+            return Err("Did not receive PoW solution\n".to_string());
+        }
+    }
+
     Ok(HandshakeData {
         auth_type,
         login: login.to_string(),
         password: password.to_string(),
         address,
     })
+}
+
+fn read_line_safe<S: Read>(stream: &mut S) -> Result<String, String> {
+    let mut reader = BufReader::new(stream);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => return Err("Client disconnected\n".to_string()),
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() > 1024 {
+                    return Err("payload too large\n".to_string());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => return Err("Timeout\n".to_string()),
+            Err(e) => return Err(format!("Read error: {}\n", e)),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+fn verify_pow(challenge: &str, nonce: u64, difficulty: usize) -> bool {
+    let mut hasher = Sha256::new();
+    hasher.update(challenge.as_bytes());
+    hasher.update(nonce.to_string().as_bytes());
+    let result = hasher.finalize();
+
+    let mut hex_str = String::new();
+    for byte in result {
+        hex_str.push_str(&format!("{:02x}", byte));
+    }
+    hex_str.ends_with(&"0".repeat(difficulty))
 }
