@@ -8,6 +8,7 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use rustls::internal::msgs::message::Message;
 
 #[derive(Debug)]
 pub struct User {
@@ -53,6 +54,22 @@ pub fn migrate(connection: &Connection) -> Result<()> {
         )
         "#,
         params![],
+    )?;
+
+    connection.execute(
+		r#"
+		CREATE TABLE IF NOT EXISTS messages (
+			id BLOB PRIMARY KEY NOT NULL,
+			sender_id BLOB NOT NULL,
+			receiver_id BLOB NOT NULL,
+			content TEXT NOT NULL,
+			timestamp INTEGER NOT NULL,
+			is_read INTEGER DEFAULT 0,
+			FOREIGN KEY(sender_id) REFERENCES users(id),
+			FOREIGN KEY(receiver_id) REFERENCES messages(id)
+      )
+      "#,
+      params![],
     )?;
     Ok(())
 }
@@ -146,6 +163,51 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
         Err(_) => return false,
     };
     Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok()
+}
+
+pub fn save_message(
+    connection: &Connection,
+    sender_id: &Uuid,
+    receiver_id: &Uuid,
+    content: &str,
+) -> Result<()> {
+    let id = Uuid::new_v4();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time before epoch")
+        .as_secs() as i64;
+
+    connection.execute(
+        "INSERT INTO messages (id, sender_id, receiver_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+        params![&id, &sender_id, &receiver_id, &content, now],
+    )?;
+    Ok(())
+}
+
+pub fn get_undelivered_messages(
+    connection: &Connection,
+    user_id: &Uuid
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = connection.prepare(
+        "SELECT m.content, u.login
+        FROM messages m
+        JOIN users u ON m.sender_id = u.id
+        WHERE m.receiver_id = ? AND m.is_read = 0
+        ORDER BY m.timestamp ASC"
+    )?;
+
+    let messages = stmt.query_map(params![user_id], |row| {
+        let content: String = row.get(0)?;
+        let sender_login: String = row.get(1)?;
+        Ok((sender_login, content))
+    })?.collect::<Result<Vec<_>, _>>()?;
+
+    connection.execute(
+        "UPDATE messages SET is_read = 1 WHERE receiver_id = ?",
+        params![user_id],
+    )?;
+
+    Ok(messages)
 }
 
 #[cfg(test)]

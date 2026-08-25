@@ -13,10 +13,11 @@ dotenvy = "0.15.7"
 argon2 = { version = "0.5.3", features = ["std"] }
 password-hash = "0.6.1"
 rand_core = "0.10.1"
-dirs = "6.0.0"
 ctrlc = "3.5.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pki-types = { version = "1.15.1", features = ["alloc"] }
 zxcvbn = "3.1.1"
-"sha2" = "0.11.0"
-"rand" = "0.10.2"
+sha2 = "0.11.0"
+rand = "0.10.2"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util",  "time", "sync"] }
+tokio-rustls = "0.26.4"
