@@ -100,6 +100,10 @@ async fn main() {
     dotenv().ok();
     logger::init("MUC-server", logger::LogLevel::Trace);
 
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
         std::thread::sleep(std::time::Duration::from_millis(50));
