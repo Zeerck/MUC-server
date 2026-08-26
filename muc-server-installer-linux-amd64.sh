@@ -176,16 +176,20 @@ mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$DATA_DIR"
 echo -e "${CYAN}=== Server settings ===${NC}"
 
 while true; do
-    printf "%s[?]%s Enter path to .cert file of domain (TLS_CERT_PATH): " "$YELLOW" "$NC"
+    printf "%s[?]%s Enter path to .crt file of domain (TLS_CERT_PATH): " "$YELLOW" "$NC"
     read tls_cert
-    if [ -f "$tls_cert" ]; then break; else print_error "File .cert not found. Try again."; fi
+    if [ -f "$tls_cert" ]; then break; else print_error "File .crt not found. Try again."; fi
 done
 
 while true; do
-    printf "%s[?]%s Enter path to .key file of domain (TLS_KEY_PATH): " "$YELLOW" "$NC"
+    printf "%s[?]%s Enter path to .crt.key file of domain (TLS_KEY_PATH): " "$YELLOW" "$NC"
     read tls_key
-    if [ -f "$tls_key" ]; then break; else print_error "File .key not found. Try again."; fi
+    if [ -f "$tls_key" ]; then break; else print_error "File .crt.key not found. Try again."; fi
 done
+
+printf "%s[?]%s PoW difficulty (weak, medium or strong) [medium]: " "$YELLOW" "$NC"
+read pow_difficulty
+pow_difficulty=${pow_difficulty:-"medium"}
 
 printf "%s[?]%s Server address:port [0.0.0.0:1990]: " "$YELLOW" "$NC"
 read server_addr
@@ -203,13 +207,14 @@ printf "%s[?]%s Handshake timeout [10]: " "$YELLOW" "$NC"
 read handshake_timeout
 handshake_timeout=${handshake_timeout:-"10"}
 
-print_message "Setting up rights to read .cert and .key files for $APP_USER..."
+print_message "Setting up rights to read .crt and .crt.key files for $APP_USER..."
 grant_cert_access "$tls_cert"
 grant_cert_access "$tls_key"
-print_message "Rights to read .cert and .key successfully granted"
+print_message "Rights to read .crt and .crt.key successfully granted"
 
 print_message "Config generating... $ENV_FILE"
 cat <<EOF > "$ENV_FILE"
+POW_DIFFICULTY=$pow_difficulty
 SERVER_ADDRESS=$server_addr
 DB_PATH=$db_path
 READ_TIMEOUT=$read_timeout

@@ -106,7 +106,7 @@ async fn main() {
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
         std::process::exit(0);
     });
 
@@ -224,7 +224,6 @@ async fn handle_client(
         Err(error_message) => {
             warning!("Authentication failed for {peer_address}: {error_message}");
             rate_limiter.lock().unwrap().record_failure(peer_ip);
-            // ТЕПЕРЬ пишем в сокет безопасно, никаких локов БД не удерживается
             let _ = tls_stream.write_all(format!("{}\n", error_message).as_bytes()).await;
             let _ = tls_stream.flush().await;
             return;

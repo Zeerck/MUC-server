@@ -8,7 +8,6 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use rustls::internal::msgs::message::Message;
 
 #[derive(Debug)]
 pub struct User {
@@ -138,7 +137,7 @@ fn map_row_to_user(row: &Row) -> rusqlite::Result<User> {
     let login: String = row.get(1)?;
     let password: String = row.get(2)?;
     let timestamp: i64 = row.get(3)?;
-    let dt_utc = match chrono::DateTime::from_timestamp_secs(timestamp) {
+    let dt_utc = match DateTime::from_timestamp_secs(timestamp) {
         Some(dt) => dt,
         None => return Err(rusqlite::Error::FromSqlConversionFailure(
            3, rusqlite::types::Type::Integer,
