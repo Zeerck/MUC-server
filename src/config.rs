@@ -10,6 +10,7 @@ pub struct Config {
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
     pub pow_difficulty: usize,
+    pub session_duration_hours: f64,
 }
 
 impl Config {
@@ -59,6 +60,12 @@ impl Config {
             _ => 5,
         };
 
+        let session_duration_hours = env::var("SESSION_DURATION_HOURS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&t| t > 0.0)
+            .unwrap_or(720.0);
+
         Self {
             server_address,
             db_path,
@@ -67,6 +74,7 @@ impl Config {
             tls_cert_path,
             tls_key_path,
             pow_difficulty,
+            session_duration_hours,
         }
     }
 }

@@ -187,6 +187,10 @@ while true; do
     if [ -f "$tls_key" ]; then break; else print_error "File .crt.key not found. Try again."; fi
 done
 
+printf "%s[?]%s Hours before user session expires [720]: " "$YELLOW" "$NC"
+read session_duration_hours
+session_duration_hours=${session_duration_hours:-"720"}
+
 printf "%s[?]%s PoW difficulty (weak, medium or strong) [medium]: " "$YELLOW" "$NC"
 read pow_difficulty
 pow_difficulty=${pow_difficulty:-"medium"}

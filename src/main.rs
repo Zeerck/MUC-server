@@ -6,14 +6,13 @@ mod hub;
 use dotenvy::dotenv;
 
 use std::{
-    collections::HashMap,
     fs::File,
     io::BufReader,
     net::{IpAddr, SocketAddr},
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
-
+use std::collections::HashMap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio::sync::mpsc;
@@ -23,16 +22,15 @@ use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use sha2::{Digest, Sha256};
 use rand::RngExt;
+use uuid::Uuid;
+
 use crate::config::Config;
 use crate::hub::Hub;
 
 static CONFIG: LazyLock<Config> = LazyLock::new(|| Config::from_env());
 
 #[derive(Debug, PartialEq)]
-enum AuthType {
-    Register,
-    Login,
-}
+enum AuthType { Token, Register, Login }
 
 #[derive(Debug)]
 struct HandshakeData {
@@ -55,7 +53,6 @@ impl RateLimiter {
             max_attempts: 5,
         }
     }
-
     fn is_blocked(&self, ip: &IpAddr) -> bool {
         if let Some(times) = self.attempts.get(ip) {
             let now = Instant::now();
@@ -64,14 +61,12 @@ impl RateLimiter {
         }
         false
     }
-
     fn record_failure(&mut self, ip: IpAddr) {
         let now = Instant::now();
         let times = self.attempts.entry(ip).or_insert_with(Vec::new);
         times.push(now);
         times.retain(|&t| now.duration_since(t) < self.window);
     }
-
     fn clear_attempts(&mut self, ip: &IpAddr) {
         self.attempts.remove(ip);
     }
@@ -98,11 +93,8 @@ fn load_tls_config() -> Arc<ServerConfig> {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
     logger::init("MUC-server", logger::LogLevel::Trace);
-
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
@@ -112,18 +104,11 @@ async fn main() {
 
     let listener = TcpListener::bind(&CONFIG.server_address).await.expect("Failed to bind listener");
     info!("Server listening on {}", &CONFIG.server_address);
-    info!("Database path: {}", CONFIG.db_path.display());
 
-    let connection = db::init_database(&CONFIG.db_path).expect("Failed to open database");
+    let pool = db::init_database(&CONFIG.db_path).await.expect("Failed to open database");
+    db::migrate(&pool).await.expect("Migration failed");
 
-    if let Err(e) = db::migrate(&connection) {
-        fatal!("Migration failed: {e}");
-        return;
-    }
-
-    let db_arc = Arc::new(Mutex::new(connection));
     let tls_acceptor = TlsAcceptor::from(load_tls_config());
-
     let fake_hash = db::hash_password("fake_password_for_timing_attack").expect("Failed to generate fake hash");
     let fake_hash_arc = Arc::new(fake_hash);
 
@@ -133,27 +118,17 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((stream, peer_address)) => {
-                let db_clone = db_arc.clone();
+                let pool_clone = pool.clone();
                 let tls_acceptor_clone = tls_acceptor.clone();
                 let fake_hash_clone = fake_hash_arc.clone();
                 let rate_limiter_clone = rate_limiter.clone();
                 let hub_clone = hub.clone();
 
                 tokio::spawn(async move {
-                    handle_client(
-                        stream,
-                        peer_address,
-                        db_clone,
-                        tls_acceptor_clone,
-                        fake_hash_clone,
-                        rate_limiter_clone,
-                        hub_clone
-                    ).await;
+                    handle_client(stream, peer_address, pool_clone, tls_acceptor_clone, fake_hash_clone, rate_limiter_clone, hub_clone).await;
                 });
             }
-            Err(e) => {
-                error!("Failed to accept connection: {e}");
-            }
+            Err(e) => error!("Failed to accept connection: {e}"),
         }
     }
 }
@@ -161,7 +136,7 @@ async fn main() {
 async fn handle_client(
     stream: TcpStream,
     peer_address: SocketAddr,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    pool: sqlx::SqlitePool,
     tls_acceptor: TlsAcceptor,
     fake_hash: Arc<String>,
     rate_limiter: Arc<Mutex<RateLimiter>>,
@@ -199,116 +174,147 @@ async fn handle_client(
         }
     };
 
-    let (user_result, undelivered_messages) = {
-        let connection = db.lock().unwrap();
-        let result = match user_handshake_data.auth_type {
-            AuthType::Register => register_user(&connection, &user_handshake_data.login, &user_handshake_data.password),
-            AuthType::Login => login_user(&connection, &user_handshake_data.login, &user_handshake_data.password, &fake_hash),
-        };
-
-        let messages = if let Ok(ref u) = result {
-            db::get_undelivered_messages(&connection, &u.id).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        (result, messages)
+    let user_result = match user_handshake_data.auth_type {
+        AuthType::Token => validate_session(&pool, &user_handshake_data.password, CONFIG.session_duration_hours).await,
+        AuthType::Login => login_user(&pool, &user_handshake_data.login, &user_handshake_data.password, &fake_hash).await,
+        AuthType::Register => register_user(&pool, &user_handshake_data.login, &user_handshake_data.password).await,
     };
 
     let user = match user_result {
         Ok(u) => {
-            info!("User '{}' successfully authenticated", u.login);
             rate_limiter.lock().unwrap().clear_attempts(&peer_ip);
             u
         },
         Err(error_message) => {
             warning!("Authentication failed for {peer_address}: {error_message}");
             rate_limiter.lock().unwrap().record_failure(peer_ip);
-            let _ = tls_stream.write_all(format!("{}\n", error_message).as_bytes()).await;
+            let _ = tls_stream.write_all(format!("AUTH_FAILED {}\n", error_message).as_bytes()).await;
             let _ = tls_stream.flush().await;
             return;
         }
     };
 
-    for (sender_login, message) in undelivered_messages {
-        let offline_message = format!("HISTORY {} {}\n", sender_login, message);
-        let _ = tls_stream.write_all(offline_message.as_bytes()).await;
-    }
+    let (token, expires_at) = match db::create_session(&pool, user.id, CONFIG.session_duration_hours).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to create session: {e}");
+            let _ = tls_stream.write_all(b"AUTH_FAILED Internal server error\n").await;
+            return;
+        }
+    };
 
+    let auth_ok_msg = format!("AUTH_OK {} {} {}\n", user.chat_id, token, expires_at);
+    let _ = tls_stream.write_all(auth_ok_msg.as_bytes()).await;
+    let _ = tls_stream.flush().await;
+
+    if let Ok(friends) = db::get_friends_list(&pool, &user.id).await {
+        let list: Vec<String> = friends.iter().map(|(id, login)| format!("{}:{}", id, login)).collect();
+        let msg = format!("FRIEND_LIST {}\n", list.join(","));
+        let _ = tls_stream.write_all(msg.as_bytes()).await;
+    }
+    if let Ok(reqs) = db::get_pending_requests(&pool, &user.id).await {
+        let list: Vec<String> = reqs.iter().map(|(id, login)| format!("{}:{}", id, login)).collect();
+        let msg = format!("PENDING_REQS {}\n", list.join(","));
+        let _ = tls_stream.write_all(msg.as_bytes()).await;
+    }
     let _ = tls_stream.flush().await;
 
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = AsyncBufReader::new(reader);
 
-    let user_login = user.login.clone();
-    let user_id = user.id.clone();
-    info!("User {user_login} ({peer_address}) entered main loop");
+    info!("User {} ({}) entered main loop", user.login, peer_address);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    hub.register(user_id, tx);
+    hub.register(user.chat_id, tx);
 
     let write_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            if writer.write_all(message.as_bytes()).await.is_err() {
-                break;
-            }
-            if writer.flush().await.is_err() {
-                break;
-            }
+            if writer.write_all(message.as_bytes()).await.is_err() { break; }
+            if writer.flush().await.is_err() { break; }
         }
     });
 
     let mut buf = String::new();
+    let user_chat_id = user.chat_id;
+    let user_login = user.login.clone();
+    let user_id = user.id.clone();
 
     loop {
         buf.clear();
         match tokio::time::timeout(CONFIG.read_timeout, reader.read_line(&mut buf)).await {
-            Ok(Ok(0)) => {
-                trace!("Client {peer_address} ({user_login}) closed connection");
-                break;
-            }
+            Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
-                let message = buf.trim().to_string();
+                let msg = buf.trim().to_string();
+                if msg.is_empty() { continue; }
+                trace!("Msg from {user_login}: {msg}");
 
-                if message.is_empty() {
-                    continue;
-                }
-
-                info!("Message from {user_login} ({peer_address}): {message})");
-
-                if let Some(rest) = message.strip_prefix("SEND_MSG ") {
-                    let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-
-                    if parts.len() == 2 {
-                        let target_login = parts[0];
-                        let message_content = parts[1];
-
-                        let target_user_id = {
-                            let conn = db.lock().unwrap();
-                            if let Ok(Some(target_user)) = db::get_user_by_login(&conn, target_login) {
-                                let _ = db::save_message(&conn, &user_id, &target_user.id, message_content);
-                                Some(target_user.id)
-                            } else {
-                                None
-                            }
-                        };
-
-                        if let Some(target_id) = target_user_id {
-                            let formatted_msg = format!("RECV_MSG {} {}\n", user_login, message_content);
-
-                            if !hub.send_to(&target_id, &formatted_msg) {
-                                let _ = hub.send_to(&user_id, &format!("INFO User '{}' is offline. Message saved.\n", target_login));
-                            } else {
-                                let _ = hub.send_to(&user_id, &format!("INFO Message delivered to {}.\n", target_login));
-                            }
-                        } else {
-                            let _ = hub.send_to(&user_id, &format!("ERROR User '{}' not found.\n", target_login));
-                        }
+                if let Some(rest) = msg.strip_prefix("SEARCH ") {
+                    if let Ok(Some(found)) = db::get_user_by_login(&pool, rest).await {
+                        let _ = hub.send_to(user_chat_id, &format!("USER_FOUND {} {}\n", found.chat_id, found.login));
                     } else {
-                        let _ = hub.send_to(&user_id, "ERROR Invalid format. Use: SEND_MSG <login> <message>\n");
+                        let _ = hub.send_to(user_chat_id, "USER_NOT_FOUND\n");
                     }
-                } else {
-                    let _ = hub.send_to(&user_id, "ERROR Unknown command.\n");
+                }
+                else if let Some(rest) = msg.strip_prefix("FRIEND_REQ ") {
+                    if let Ok(target_chat_id) = rest.parse::<i64>() {
+                        if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
+                            let _ = db::add_friend_request(&pool, &user_id, &target.id).await;
+                            let _ = hub.send_to(target_chat_id, &format!("INCOMING_REQ {} {}\n", user_chat_id, user_login));
+                            let _ = hub.send_to(user_chat_id, "INFO Request sent\n");
+                        }
+                    }
+                }
+                else if let Some(rest) = msg.strip_prefix("ACCEPT_FRIEND ") {
+                    if let Ok(target_chat_id) = rest.parse::<i64>() {
+                        if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
+                            let _ = db::accept_friend_request(&pool, &user_id, &target.id).await;
+                            let _ = hub.send_to(target_chat_id, &format!("FRIEND_ADDED {} {}\n", user_chat_id, user_login));
+                            let _ = hub.send_to(user_chat_id, &format!("FRIEND_ADDED {} {}\n", target_chat_id, target.login));
+                        }
+                    }
+                }
+                else if let Some(rest) = msg.strip_prefix("GET_HISTORY ") {
+                    if let Some(parts) = rest.split_whitespace().next() {
+                        if let Ok(target_chat_id) = parts.parse::<i64>() {
+                            if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
+                                if let Ok(chat_id) = db::get_or_create_private_chat(&pool, &user_id, &target.id).await {
+                                    if let Ok(history) = db::get_chat_history(&pool, &chat_id, 50).await {
+                                        for (msg_id, sender_id, content, ts) in history {
+                                            let sender_chat = if sender_id == user_id { user_chat_id } else { target_chat_id };
+                                            let _ = hub.send_to(user_chat_id, &format!("HISTORY_MSG {} {} {} {}\n", msg_id, sender_chat, ts, content));
+                                        }
+                                        let _ = hub.send_to(user_chat_id, "HISTORY_END\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else if let Some(rest) = msg.strip_prefix("SEND_MSG ") {
+                    let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+                    if parts.len() == 3 {
+                        let msg_uuid = match Uuid::parse_str(parts[0]) { Ok(u) => u, Err(_) => continue };
+                        let target_chat_id = match parts[1].parse::<i64>() { Ok(u) => u, Err(_) => continue };
+                        let content = parts[2];
+
+                        if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
+                            if let Ok(chat_id) = db::get_or_create_private_chat(&pool, &user_id, &target.id).await {
+                                let _ = db::save_chat_message(&pool, &msg_uuid, &chat_id, &user_id, content).await;
+                                let _ = hub.send_to(user_chat_id, &format!("MSG_ACK {}\n", msg_uuid));
+
+                                let ts = chrono::Utc::now().timestamp();
+                                let _ = hub.send_to(target_chat_id, &format!("RECV_MSG {} {} {} {} {}\n", msg_uuid, chat_id, user_chat_id, ts, content));
+                            }
+                        }
+                    }
+                }
+                else if let Some(rest) = msg.strip_prefix("MSG_READ ") {
+                    if let Ok(msg_uuid) = Uuid::parse_str(rest.trim()) {
+                        if let Ok(Some(sender_chat_id)) = db::get_message_sender(&pool, &msg_uuid).await {
+                            let _ = db::mark_message_as_read(&pool, &msg_uuid).await;
+                            let _ = hub.send_to(sender_chat_id, &format!("MSG_READ {}\n", msg_uuid));
+                        }
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -322,39 +328,36 @@ async fn handle_client(
         }
     }
 
-    hub.unregister(&user_id);
+    hub.unregister(user_chat_id);
     write_task.abort();
     trace!("Connection finished for: {peer_address} ({user_login})");
 }
 
-fn register_user(
-    connection: &rusqlite::Connection,
-    login: &str,
-    password: &str,
-) -> Result<db::User, String> {
-    match db::add_user(connection, login, password) {
+async fn validate_session(pool: &sqlx::SqlitePool, token: &str, duration: f64) -> Result<db::User, String> {
+    db::validate_session(pool, token, duration).await
+        .map_err(|e| format!("Session error: {e}"))?
+        .ok_or_else(|| "Invalid or expired token".to_string())
+}
+
+async fn register_user(pool: &sqlx::SqlitePool, login: &str, password: &str) -> Result<db::User, String> {
+    match db::add_user(pool, login, password).await {
         Ok(user) => Ok(user),
         Err(e) => {
-            warning!("Registration failed for {login}: {e}");
+            warning!("Registration failed for '{login}': {e}");
             Err("Registration failed. Check login format and password strength.".to_string())
         }
     }
 }
 
-fn login_user(
-    connection: &rusqlite::Connection,
-    login: &str,
-    password: &str,
-    fake_hash: &str,
-) -> Result<db::User, String> {
-    if let Some(existing) = db::get_user_by_login(connection, login).map_err(|e| e.to_string())? {
+async fn login_user(pool: &sqlx::SqlitePool, login: &str, password: &str, fake_hash: &str) -> Result<db::User, String> {
+    if let Some(existing) = db::get_user_by_login(pool, login).await.map_err(|e| e.to_string())? {
         if db::verify_password(password, &existing.password) {
             return Ok(existing);
         }
     } else {
         let _ = db::verify_password(password, fake_hash);
     }
-    Err("Wrong login or password! Disconnecting.".to_string())
+    Err("Wrong login or password!".to_string())
 }
 
 async fn get_user_handshake_data_async<S: AsyncBufReadExt + AsyncWriteExt + Unpin>(
@@ -375,28 +378,31 @@ async fn get_user_handshake_data_async<S: AsyncBufReadExt + AsyncWriteExt + Unpi
 
     let mut parts = line.splitn(3, ' ');
     let command = parts.next().ok_or("Missing command\n".to_string())?;
-    let login = parts.next().ok_or("Missing login\n".to_string())?;
-    let password = parts.next().ok_or("Missing password\n".to_string())?;
+    let login = parts.next().unwrap_or("");
+    let password = parts.next().unwrap_or("");
 
     let auth_type = match command.to_uppercase().as_str() {
-        "REGISTER" => AuthType::Register,
+        "AUTH_TOKEN" => AuthType::Token,
         "LOGIN" => AuthType::Login,
+        "REGISTER" => AuthType::Register,
         _ => return Err("Invalid command\n".to_string()),
     };
+
+    if auth_type != AuthType::Token && (login.is_empty() || password.is_empty()) {
+        return Err("Missing login or password\n".to_string());
+    }
 
     if auth_type == AuthType::Register {
         let challenge: String = (0..16)
             .map(|_| format!("{:x}", rand::rng().random_range(0..16)))
             .collect();
-
         let difficulty = CONFIG.pow_difficulty;
 
-        stream.write_all(format!("SOLVE {} {}\n", challenge, difficulty).as_bytes())
-            .await.map_err(|e| format!("Write error: {e}\n"))?;
+        stream.write_all(format!("SOLVE {} {}\n", challenge, difficulty).as_bytes()).await.map_err(|e| format!("Write error: {e}\n"))?;
         stream.flush().await.map_err(|e| format!("Flush error: {e}\n"))?;
 
         let mut solve_line = String::new();
-        match tokio::time::timeout(CONFIG.read_timeout, stream.read_line(&mut solve_line)).await {
+        match tokio::time::timeout(CONFIG.handshake_timeout, stream.read_line(&mut solve_line)).await {
             Ok(Ok(0)) => return Err("Client disconnected before sending PoW\n".to_string()),
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(format!("Failed to read PoW: {e}\n")),
@@ -404,7 +410,6 @@ async fn get_user_handshake_data_async<S: AsyncBufReadExt + AsyncWriteExt + Unpi
         }
 
         let solve_line = solve_line.trim();
-
         if let Some(nonce_str) = solve_line.strip_prefix("SOLVED ") {
             if let Ok(nonce) = nonce_str.parse::<u64>() {
                 if !verify_pow(&challenge, nonce, difficulty) {
