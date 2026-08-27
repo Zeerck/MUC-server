@@ -378,14 +378,14 @@ pub async fn get_user_by_chat_id(pool: &SqlitePool, chat_id: &i64) -> Result<Opt
 
 pub async fn accept_friend_request(pool: &SqlitePool, user_id: &Uuid, friend_id: &Uuid) -> Result<()> {
     sqlx::query("UPDATE friends SET status = 'accepted' WHERE user_id = ? AND friend_id = ?")
-        .bind(user_id)
         .bind(friend_id)
+        .bind(user_id)
         .execute(pool)
         .await?;
 
     sqlx::query("INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?, ?, 'accepted')")
-        .bind(friend_id)
         .bind(user_id)
+        .bind(friend_id)
         .execute(pool)
         .await?;
 
