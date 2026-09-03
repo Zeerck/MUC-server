@@ -1,4 +1,4 @@
-use crate::{db, trace};
+use crate::{db, logger, trace};
 use std::{env, path::PathBuf, time::Duration};
 
 #[derive(Debug)]
@@ -11,6 +11,7 @@ pub struct Config {
     pub tls_key_path: PathBuf,
     pub pow_difficulty: usize,
     pub session_duration_hours: f64,
+    pub log_level: logger::LogLevel,
 }
 
 impl Config {
@@ -66,6 +67,18 @@ impl Config {
             .filter(|&t| t > 0.0)
             .unwrap_or(720.0);
 
+        let log_level = match env::var("LOG_LEVEL").unwrap_or_default().to_uppercase().as_str() {
+            "TRACE" => logger::LogLevel::Trace,
+            "DEBUG" => logger::LogLevel::Debug,
+            "INFO" | "" => logger::LogLevel::Info,
+            "WARN" | "WARNING" => logger::LogLevel::Warning,
+            "ERROR" => logger::LogLevel::Error,
+            unknown => {
+                eprintln!("Unknown LOG_LEVEL value '{unknown}', falling back to INFO");
+                logger::LogLevel::Info
+            }
+        };
+
         Self {
             server_address,
             db_path,
@@ -75,6 +88,7 @@ impl Config {
             tls_key_path,
             pow_difficulty,
             session_duration_hours,
+            log_level,
         }
     }
 }
