@@ -3,3 +3,6 @@
 *.sqlite
 *.sqlite-journal
 /db/
+/certs
+/dev-data
+.idea
