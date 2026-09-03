@@ -94,7 +94,8 @@ fn load_tls_config() -> Arc<ServerConfig> {
 async fn main() {
     dotenv().ok();
     rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
-    logger::init("MUC-server", logger::LogLevel::Trace);
+    logger::init("MUC-server", CONFIG.log_level);
+    info!("MUC-server v{} starting", env!("CARGO_PKG_VERSION"));
 
     let _ = ctrlc::set_handler(move || {
         info!("Program exit with CTRL+C");
@@ -175,7 +176,7 @@ async fn handle_client(
     };
 
     let user_result = match user_handshake_data.auth_type {
-        AuthType::Token => validate_session(&pool, &user_handshake_data.password, CONFIG.session_duration_hours).await,
+        AuthType::Token => validate_session(&pool, &user_handshake_data.login, CONFIG.session_duration_hours).await,
         AuthType::Login => login_user(&pool, &user_handshake_data.login, &user_handshake_data.password, &fake_hash).await,
         AuthType::Register => register_user(&pool, &user_handshake_data.login, &user_handshake_data.password).await,
     };
@@ -203,29 +204,14 @@ async fn handle_client(
         }
     };
 
-    let auth_ok_msg = format!("AUTH_OK {} {} {}\n", user.chat_id, token, expires_at);
-    let _ = tls_stream.write_all(auth_ok_msg.as_bytes()).await;
-    let _ = tls_stream.flush().await;
-
-    if let Ok(friends) = db::get_friends_list(&pool, &user.id).await {
-        let list: Vec<String> = friends.iter().map(|(id, login)| format!("{}:{}", id, login)).collect();
-        let msg = format!("FRIEND_LIST {}\n", list.join(","));
-        let _ = tls_stream.write_all(msg.as_bytes()).await;
-    }
-    if let Ok(reqs) = db::get_pending_requests(&pool, &user.id).await {
-        let list: Vec<String> = reqs.iter().map(|(id, login)| format!("{}:{}", id, login)).collect();
-        let msg = format!("PENDING_REQS {}\n", list.join(","));
-        let _ = tls_stream.write_all(msg.as_bytes()).await;
-    }
-    let _ = tls_stream.flush().await;
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let tx_cleanup = tx.clone();
+    hub.register(user.chat_id, tx);
 
     let (reader, mut writer) = tokio::io::split(tls_stream);
     let mut reader = AsyncBufReader::new(reader);
 
     info!("User {} ({}) entered main loop", user.login, peer_address);
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    hub.register(user.chat_id, tx);
 
     let write_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
@@ -237,25 +223,36 @@ async fn handle_client(
     let mut buf = String::new();
     let user_chat_id = user.chat_id;
     let user_login = user.login.clone();
-    let user_id = user.id.clone();
+    let user_id = user.id;
+
+    let _ = hub.send_to(user_chat_id, &format!("AUTH_OK {} {} {}\n", user_chat_id, token, expires_at));
+
+    if let Ok(friends) = db::get_friends_list(&pool, &user_id).await {
+        let list: Vec<String> = friends.iter().map(|(id, login)| format!("{}:{}", id, login)).collect();
+        let _ = hub.send_to(user_chat_id, &format!("FRIEND_LIST {}\n", list.join(",")));
+    }
+    if let Ok(reqs) = db::get_pending_requests(&pool, &user_id).await {
+        let list: Vec<String> = reqs.iter().map(|(id, login)| format!("{}:{}", id, login)).collect();
+        let _ = hub.send_to(user_chat_id, &format!("PENDING_REQS {}\n", list.join(",")));
+    }
 
     loop {
         buf.clear();
         match tokio::time::timeout(CONFIG.read_timeout, reader.read_line(&mut buf)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(_)) => {
-                let msg = buf.trim().to_string();
-                if msg.is_empty() { continue; }
-                trace!("Msg from {user_login}: {msg}");
+                let message = buf.trim().to_string();
+                if message.is_empty() { continue; }
+                trace!("Message from {user_login}: {} bytes", message.len());
 
-                if let Some(rest) = msg.strip_prefix("SEARCH ") {
+                if let Some(rest) = message.strip_prefix("SEARCH ") {
                     if let Ok(Some(found)) = db::get_user_by_login(&pool, rest).await {
                         let _ = hub.send_to(user_chat_id, &format!("USER_FOUND {} {}\n", found.chat_id, found.login));
                     } else {
                         let _ = hub.send_to(user_chat_id, "USER_NOT_FOUND\n");
                     }
                 }
-                else if let Some(rest) = msg.strip_prefix("FRIEND_REQ ") {
+                else if let Some(rest) = message.strip_prefix("FRIEND_REQ ") {
                     if let Ok(target_chat_id) = rest.parse::<i64>() {
                         if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
                             let _ = db::add_friend_request(&pool, &user_id, &target.id).await;
@@ -264,7 +261,7 @@ async fn handle_client(
                         }
                     }
                 }
-                else if let Some(rest) = msg.strip_prefix("ACCEPT_FRIEND ") {
+                else if let Some(rest) = message.strip_prefix("ACCEPT_FRIEND ") {
                     if let Ok(target_chat_id) = rest.parse::<i64>() {
                         if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
                             let _ = db::accept_friend_request(&pool, &user_id, &target.id).await;
@@ -273,7 +270,7 @@ async fn handle_client(
                         }
                     }
                 }
-                else if let Some(rest) = msg.strip_prefix("GET_HISTORY ") {
+                else if let Some(rest) = message.strip_prefix("GET_HISTORY ") {
                     if let Some(parts) = rest.split_whitespace().next() {
                         if let Ok(target_chat_id) = parts.parse::<i64>() {
                             if let Ok(Some(target)) = db::get_user_by_chat_id(&pool, &target_chat_id).await {
@@ -290,7 +287,7 @@ async fn handle_client(
                         }
                     }
                 }
-                else if let Some(rest) = msg.strip_prefix("SEND_MSG ") {
+                else if let Some(rest) = message.strip_prefix("SEND_MSG ") {
                     let parts: Vec<&str> = rest.splitn(3, ' ').collect();
                     if parts.len() == 3 {
                         let msg_uuid = match Uuid::parse_str(parts[0]) { Ok(u) => u, Err(_) => continue };
@@ -308,17 +305,22 @@ async fn handle_client(
                         }
                     }
                 }
-                else if let Some(rest) = msg.strip_prefix("MSG_READ ") {
+                else if let Some(rest) = message.strip_prefix("MSG_READ ") {
                     if let Ok(msg_uuid) = Uuid::parse_str(rest.trim()) {
-                        if let Ok(Some(sender_chat_id)) = db::get_message_sender(&pool, &msg_uuid).await {
-                            let _ = db::mark_message_as_read(&pool, &msg_uuid).await;
+                        if let Ok(Some(sender_chat_id)) =
+                            db::mark_message_as_read_checked(&pool, &msg_uuid, &user_id).await
+                        {
                             let _ = hub.send_to(sender_chat_id, &format!("MSG_READ {}\n", msg_uuid));
                         }
                     }
                 }
             }
             Ok(Err(e)) => {
-                warning!("Error reading from {peer_address} ({user_login}): {e}");
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    trace!("Client {peer_address} ({user_login}) dropped connection without TLS close_notify");
+                } else {
+                    warning!("Error reading from {peer_address} ({user_login}): {e}");
+                }
                 break;
             }
             Err(_) => {
@@ -328,7 +330,7 @@ async fn handle_client(
         }
     }
 
-    hub.unregister(user_chat_id);
+    hub.unregister_if(user_chat_id, &tx_cleanup);
     write_task.abort();
     trace!("Connection finished for: {peer_address} ({user_login})");
 }
@@ -374,8 +376,6 @@ async fn get_user_handshake_data_async<S: AsyncBufReadExt + AsyncWriteExt + Unpi
     }
 
     let line = line.trim();
-    trace!("Received handshake from {address}: {line}");
-
     let mut parts = line.splitn(3, ' ');
     let command = parts.next().ok_or("Missing command\n".to_string())?;
     let login = parts.next().unwrap_or("");

@@ -1,14 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use zxcvbn::Score;
-use std::{fs, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use std::{fs, path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH, Duration}};
 use uuid::{Uuid};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use sqlx::Row;
-use sqlx::sqlite::{SqlitePoolOptions, SqlitePool, SqliteRow};
+use sqlx::sqlite::{
+    SqliteConnectOptions,
+    SqliteJournalMode,
+    SqlitePoolOptions,
+    SqlitePool,
+    SqliteSynchronous,
+    SqliteRow,
+};
 
 #[derive(Debug)]
 pub struct User {
@@ -24,75 +31,26 @@ pub async fn init_database(db_path: &Path) -> Result<SqlitePool> {
         fs::create_dir_all(parent)?;
     }
 
-    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&db_url)
-        .await?;
-
-    sqlx::query("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
-        .execute(&pool)
+        .connect_with(opts)
         .await?;
 
     Ok(pool)
 }
 
 pub async fn migrate(pool: &SqlitePool) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS users (
-                id BLOB PRIMARY KEY NOT NULL,
-                chat_id INTEGER NOT NULL UNIQUE,
-                login TEXT NOT NULL UNIQUE,
-                password TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY NOT NULL,
-                user_id BLOB NOT NULL,
-                expires_at INTEGER NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS chats (
-                id BLOB PRIMARY KEY NOT NULL,
-                type TEXT NOT NULL,
-                title TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS chat_members (
-                chat_id BLOB NOT NULL,
-                user_id BLOB NOT NULL,
-                joined_at INTEGER NOT NULL,
-                PRIMARY KEY(chat_id, user_id),
-                FOREIGN KEY(chat_id) REFERENCES chats(id),
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                id BLOB PRIMARY KEY NOT NULL,
-                chat_id BLOB NOT NULL,
-                sender_id BLOB NOT NULL,
-                content TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                is_read INTEGER DEFAULT 0,
-                FOREIGN KEY(chat_id) REFERENCES chats(id),
-                FOREIGN KEY(sender_id) REFERENCES users(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS friends (
-                user_id BLOB NOT NULL,
-                friend_id BLOB NOT NULL,
-                status TEXT NOT NULL,
-                PRIMARY KEY(user_id, friend_id),
-                FOREIGN KEY(user_id) REFERENCES users(id),
-                FOREIGN KEY(friend_id) REFERENCES users(id)
-            );
-            "#,
-        ).execute(pool).await?;
-
+    sqlx::migrate!("./migrations")
+        .run(pool)
+        .await?;
     Ok(())
 }
 
@@ -278,19 +236,28 @@ pub fn verify_password(password: &str, phc_hash: &str) -> bool {
     Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok()
 }
 
-pub async fn get_or_create_private_chat(pool: &SqlitePool, user1_id: &Uuid, user2_id: &Uuid) -> Result<Uuid> {
-    let existing_chat: Option<(Uuid,)> = sqlx::query_as(
+pub async fn get_or_create_private_chat(
+    pool: &SqlitePool,
+    user1_id: &Uuid,
+    user2_id: &Uuid,
+) -> Result<Uuid> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("failed to begin transaction")?;
+
+    let existing: Option<(Uuid,)> = sqlx::query_as(
         "SELECT c.id FROM chats c
             JOIN chat_members cm1 ON c.id = cm1.chat_id AND cm1.user_id = ?
             JOIN chat_members cm2 ON c.id = cm2.chat_id AND cm2.user_id = ?
-            WHERE c.type = 'private'"
+            WHERE c.type = 'private'",
     )
         .bind(user1_id)
         .bind(user2_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
-    if let Some((chat_id,)) = existing_chat {
+    if let Some((chat_id,)) = existing {
         return Ok(chat_id);
     }
 
@@ -300,23 +267,24 @@ pub async fn get_or_create_private_chat(pool: &SqlitePool, user1_id: &Uuid, user
     sqlx::query("INSERT INTO chats (id, type, created_at) VALUES (?, 'private', ?)")
         .bind(chat_id)
         .bind(now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     sqlx::query("INSERT INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)")
         .bind(chat_id)
         .bind(user1_id)
         .bind(now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     sqlx::query("INSERT INTO chat_members (chat_id, user_id, joined_at) VALUES (?, ?, ?)")
         .bind(chat_id)
         .bind(user2_id)
         .bind(now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
+    tx.commit().await.context("failed to commit private chat")?;
     Ok(chat_id)
 }
 
@@ -354,13 +322,47 @@ pub async fn get_chat_history(pool: &SqlitePool, chat_id: &Uuid, limit: i64) -> 
     Ok(rows)
 }
 
-pub async fn mark_message_as_read(pool: &SqlitePool, message_id: &Uuid) -> Result<()> {
-    sqlx::query("UPDATE messages SET is_read = 1 WHERE id = ?")
+/// Помечает сообщение прочитанным, только если reader — участник чата этого
+/// сообщения и не его автор. Возвращает chat_id отправителя, если уведомить
+/// нужно (только что прочитано впервые), иначе None.
+pub async fn mark_message_as_read_checked(
+    pool: &SqlitePool,
+    message_id: &Uuid,
+    reader_id: &Uuid,
+) -> Result<Option<i64>> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("failed to begin transaction")?;
+
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT m.sender_id FROM messages m
+         JOIN chat_members cm ON cm.chat_id = m.chat_id AND cm.user_id = ?
+         WHERE m.id = ? AND m.sender_id != ?",
+    )
+        .bind(reader_id)
         .bind(message_id)
-        .execute(pool)
+        .bind(reader_id)
+        .fetch_optional(&mut *tx)
         .await?;
 
-    Ok(())
+    let Some((sender_id,)) = row else {
+        return Ok(None);
+    };
+
+    let result = sqlx::query("UPDATE messages SET is_read = 1 WHERE id = ? AND is_read = 0")
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    if result.rows_affected() > 0 {
+        let sender = get_user_by_id(pool, sender_id).await?;
+        Ok(sender.map(|u| u.chat_id))
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn get_user_by_chat_id(pool: &SqlitePool, chat_id: &i64) -> Result<Option<User>> {
@@ -432,22 +434,6 @@ pub async fn get_pending_requests(pool: &SqlitePool, user_id: &Uuid) -> Result<V
     Ok(reqs)
 }
 
-pub async fn get_message_sender(pool: &SqlitePool, message_id: &Uuid) -> Result<Option<i64>> {
-    let row = sqlx::query("SELECT sender_id FROM messages WHERE id = ?")
-        .bind(message_id)
-        .fetch_optional(pool)
-        .await?;
-
-    if let Some(row) = row {
-        let sender_id: Uuid = row.try_get("sender_id")?;
-        let sender = get_user_by_id(pool, sender_id).await?;
-
-        Ok(sender.map(|u| u.chat_id))
-    } else {
-        Ok(None)
-    }
-}
-
 pub async fn add_friend_request(pool: &SqlitePool, user_id: &Uuid, friend_id: &Uuid) -> Result<()> {
     sqlx::query("INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?, ?, 'pending')")
         .bind(user_id)
@@ -461,33 +447,76 @@ pub async fn add_friend_request(pool: &SqlitePool, user_id: &Uuid, friend_id: &U
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
-    #[tokio::test]
-    async fn test_db_operations() -> Result<()> {
+    async fn setup_pool() -> Result<SqlitePool> {
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite://:memory:")?
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(opts)
             .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(pool)
+    }
 
-        migrate(&pool).await?;
+    #[tokio::test]
+    async fn test_full_flow() -> Result<()> {
+        let pool = setup_pool().await?;
 
-        let login = "Alice";
-        let password = "best_password_123_A!";
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
 
-        let user = add_user(&pool, login, &password).await?;
-        assert!(!user.id.is_nil());
+        assert!(get_user_by_login(&pool, "alice").await?.is_some());
 
-        let fetched = get_user_by_login(&pool, login).await?;
-        assert!(fetched.is_some());
-        let user = fetched.unwrap();
-        assert_eq!(user.login, login);
+        let c1 = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+        let c2 = get_or_create_private_chat(&pool, &bob.id, &alice.id).await?;
+        assert_eq!(c1, c2);
 
-        let deleted = delete_user(&pool, &user.id).await?;
-        assert!(deleted);
+        let msg_id = Uuid::new_v4();
+        save_chat_message(&pool, &msg_id, &c1, &alice.id, "hello").await?;
+        let history = get_chat_history(&pool, &c1, 50).await?;
+        assert_eq!(history.len(), 1);
 
-        let after_delete = get_user_by_login(&pool, login).await?;
-        assert!(after_delete.is_none());
+        let (token, _) = create_session(&pool, alice.id, 720.0).await?;
+        assert!(validate_session(&pool, &token, 720.0).await?.is_some());
 
+        add_friend_request(&pool, &bob.id, &alice.id).await?;
+        accept_friend_request(&pool, &alice.id, &bob.id).await?;
+        assert_eq!(get_friends_list(&pool, &alice.id).await?.len(), 1);
+        assert_eq!(get_pending_requests(&pool, &alice.id).await?.len(), 0);
+
+        assert!(delete_user(&pool, &alice.id).await?);
+        assert!(validate_session(&pool, &token, 720.0).await?.is_none());
+        assert!(get_friends_list(&pool, &bob.id).await?.is_empty());
+        assert!(get_user_by_login(&pool, "Alice").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_msg_read_authorization() -> Result<()> {
+        let pool = setup_pool().await?;
+
+        let alice = add_user(&pool, "Alice", "best_password_123_A!").await?;
+        let bob = add_user(&pool, "Bob", "other_password_456_B!").await?;
+        let carol = add_user(&pool, "Carol", "carol_password_789_C!").await?;
+        let chat = get_or_create_private_chat(&pool, &alice.id, &bob.id).await?;
+
+        let msg_id = Uuid::new_v4();
+        save_chat_message(&pool, &msg_id, &chat, &alice.id, "hi bob").await?;
+
+        assert!(mark_message_as_read_checked(&pool, &msg_id, &carol.id).await?.is_none());
+        assert!(mark_message_as_read_checked(&pool, &msg_id, &alice.id).await?.is_none());
+
+        let is_read: i64 = sqlx::query_scalar("SELECT is_read FROM messages WHERE id = ?")
+            .bind(msg_id).fetch_one(&pool).await?;
+        assert_eq!(is_read, 0);
+
+        assert_eq!(
+            mark_message_as_read_checked(&pool, &msg_id, &bob.id).await?,
+            Some(alice.chat_id)
+        );
+        assert!(mark_message_as_read_checked(&pool, &msg_id, &bob.id).await?.is_none());
         Ok(())
     }
 }
