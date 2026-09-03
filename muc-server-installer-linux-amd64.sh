@@ -1,6 +1,5 @@
 #!/bin/bash
 
-DOWNLOAD_URL="https://github.com/Zeerck/MUC-server/releases/latest/download/MUC-server-linux-amd64.tar.gz"
 APP_USER="muc-server"
 INSTALL_DIR="/opt/muc-server"
 CONFIG_DIR="/etc/muc-server"
@@ -10,6 +9,27 @@ ENV_FILE="$CONFIG_DIR/muc-server.env"
 BIN_FILE="$INSTALL_DIR/MUC-server"
 
 REQUIRED_VARS=("TLS_CERT_PATH" "TLS_KEY_PATH")
+
+DOWNLOAD_URL="https://github.com/Zeerck/MUC-server/releases/latest/download/MUC-server-linux-amd64.tar.gz"
+CHANNEL_LABEL="stable"
+
+if [ "$1" == "--pre-release" ] || [ "$1" == "--tag" ]; then
+    MODE="$1"
+    if [ -z "$2" ]; then
+        echo "Usage: $0 ${MODE} <tag>   (example: $0 --pre-release v0.2.0-rc.1)" >&2
+        exit 1
+    fi
+    RELEASE_TAG="$2"
+    case "$RELEASE_TAG" in
+        v*) : ;;
+        *) echo "Tag must start with 'v' (got: ${RELEASE_TAG})" >&2; exit 1 ;;
+    esac
+    DOWNLOAD_URL="https://github.com/Zeerck/MUC-server/releases/download/${RELEASE_TAG}/MUC-server-linux-amd64.tar.gz"
+    CHANNEL_LABEL="${RELEASE_TAG}"
+    if [ "$MODE" == "--pre-release" ]; then
+        CHANNEL_LABEL="PRE-RELEASE ${RELEASE_TAG} (testing build)"
+    fi
+fi
 
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
@@ -98,6 +118,16 @@ if [ -f "$SERVICE_FILE" ]; then
         fi
     done
 
+    print_message "Backfilling missing default variables..."
+    DEFAULT_VARS=("SESSION_DURATION_HOURS=720" "LOG_LEVEL=Info")
+    for kv in "${DEFAULT_VARS[@]}"; do
+        var="${kv%%=*}"
+        if ! grep -q "^${var}=" "$ENV_FILE"; then
+            echo "$kv" >> "$ENV_FILE"
+            print_message "Added $kv to $ENV_FILE"
+        fi
+    done
+
     print_message "Verifying certificate permissions..."
     CURRENT_CERT=$(grep "^TLS_CERT_PATH=" "$ENV_FILE" | cut -d'=' -f2)
     CURRENT_KEY=$(grep "^TLS_KEY_PATH=" "$ENV_FILE" | cut -d'=' -f2)
@@ -116,7 +146,7 @@ if [ -f "$SERVICE_FILE" ]; then
     print_message "Backing up old binary..."
     cp "$BIN_FILE" "${BIN_FILE}.bak"
     
-    print_message "Downloading latest release..."
+    print_message "Downloading ${CHANNEL_LABEL}..."
     if ! command -v wget &> /dev/null; then
         print_error "'wget' package not found. Installing..."
         apt install wget -y
@@ -223,6 +253,8 @@ SERVER_ADDRESS=$server_addr
 DB_PATH=$db_path
 READ_TIMEOUT=$read_timeout
 HANDSHAKE_TIMEOUT=$handshake_timeout
+SESSION_DURATION_HOURS=$session_duration_hours
+LOG_LEVEL=Info
 TLS_CERT_PATH=$tls_cert
 TLS_KEY_PATH=$tls_key
 HOME=$DATA_DIR
@@ -231,7 +263,7 @@ EOF
 chmod 640 "$ENV_FILE"
 chown root:"$APP_USER" "$ENV_FILE"
 
-print_message "Downloading latest release of server from GitHub..."
+print_message "Downloading ${CHANNEL_LABEL} release of server from GitHub..."
 if ! command -v wget &> /dev/null; then
     print_error "'wget' package not found. Installing with: apt install wget -y"
     apt install wget -y

@@ -46,5 +46,4 @@ jobs:
             muc-server-linux-amd64.tar.gz
             muc-server-windows-x64.zip
             muc-server-installer-linux-amd64.sh
-      
-      
+          prerelease: ${{ contains(github.ref_name, '-') }}
